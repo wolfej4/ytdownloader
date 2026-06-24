@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>RT Grabber</title>
+<style>
+  :root {
+    --bg:      #14110f;
+    --panel:   #1c1916;
+    --panel-2: #221e1a;
+    --line:    #2e2823;
+    --text:    #ece6db;
+    --muted:   #948b80;
+    --accent:  #d72b32;   /* RT red */
+    --accent-d:#7c1d21;
+    --ok:      #8fb36f;
+    --warn:    #d9a441;
+    --mono: ui-monospace, "Cascadia Code", "SFMono-Regular", Menlo, Consolas, monospace;
+    --sans: ui-sans-serif, system-ui, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: var(--sans); line-height: 1.5;
+    background-image: radial-gradient(120% 80% at 50% -10%, #20100f 0%, var(--bg) 55%);
+    min-height: 100vh;
+  }
+  .wrap { max-width: 860px; margin: 0 auto; padding: 40px 22px 80px; }
+
+  header { display: flex; align-items: baseline; gap: 14px; margin-bottom: 4px; }
+  .mark {
+    font-weight: 800; font-size: 30px; letter-spacing: 0.14em;
+    text-transform: uppercase; margin: 0;
+  }
+  .mark .dot { color: var(--accent); }
+  .tag { color: var(--muted); font-size: 13px; font-family: var(--mono); }
+  .sub { color: var(--muted); margin: 0 0 28px; font-size: 14px; }
+
+  .panel {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 10px; padding: 20px; margin-bottom: 22px;
+  }
+  .label {
+    display: block; font-family: var(--mono); font-size: 11px;
+    letter-spacing: 0.12em; text-transform: uppercase; color: var(--muted);
+    margin-bottom: 8px;
+  }
+  textarea, input[type=text] {
+    width: 100%; background: var(--bg); color: var(--text);
+    border: 1px solid var(--line); border-radius: 7px; padding: 12px 13px;
+    font-family: var(--mono); font-size: 13.5px; resize: vertical;
+  }
+  textarea { min-height: 132px; }
+  textarea:focus, input:focus { outline: 2px solid var(--accent); outline-offset: 1px; border-color: transparent; }
+
+  .row { display: flex; gap: 10px; align-items: center; }
+  .row.spread { justify-content: space-between; flex-wrap: wrap; }
+
+  button {
+    font-family: var(--sans); font-size: 14px; font-weight: 600;
+    border-radius: 7px; padding: 11px 18px; cursor: pointer;
+    border: 1px solid var(--line); background: var(--panel-2); color: var(--text);
+    transition: transform .06s ease, background .15s ease, border-color .15s ease;
+  }
+  button:hover { border-color: var(--muted); }
+  button:active { transform: translateY(1px); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.primary:hover { background: #e8353c; }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+
+  .pills { display: flex; gap: 8px; font-family: var(--mono); font-size: 11px; }
+  .pill { padding: 3px 9px; border-radius: 20px; border: 1px solid var(--line); color: var(--muted); }
+  .pill.good { color: var(--ok); border-color: #38492c; }
+  .pill.bad  { color: var(--accent); border-color: var(--accent-d); }
+
+  .folder-row { display: flex; gap: 10px; }
+  .folder-row input { flex: 1; }
+
+  h2.section {
+    font-size: 12px; font-family: var(--mono); letter-spacing: 0.14em;
+    text-transform: uppercase; color: var(--muted); margin: 30px 0 12px;
+    display: flex; justify-content: space-between; align-items: center;
+  }
+  .clear-btn { font-size: 12px; padding: 5px 11px; }
+
+  .empty {
+    border: 1px dashed var(--line); border-radius: 10px; padding: 26px;
+    text-align: center; color: var(--muted); font-size: 14px;
+  }
+
+  .job {
+    background: var(--panel); border: 1px solid var(--line);
+    border-left: 3px solid var(--line);
+    border-radius: 8px; padding: 13px 15px; margin-bottom: 10px;
+  }
+  .job.running { border-left-color: var(--accent); }
+  .job.done    { border-left-color: var(--ok); }
+  .job.error   { border-left-color: var(--accent); }
+  .job.queued  { border-left-color: var(--warn); }
+
+  .job-top { display: flex; justify-content: space-between; gap: 12px; align-items: baseline; }
+  .job-title { font-size: 14px; font-weight: 600; word-break: break-word; }
+  .job-url { font-family: var(--mono); font-size: 11px; color: var(--muted); word-break: break-all; }
+  .job-state {
+    font-family: var(--mono); font-size: 11px; letter-spacing: 0.1em;
+    text-transform: uppercase; white-space: nowrap;
+  }
+  .job-state.running { color: var(--accent); }
+  .job-state.done { color: var(--ok); }
+  .job-state.error { color: var(--accent); }
+  .job-state.queued { color: var(--warn); }
+
+  .bar { height: 6px; background: var(--bg); border-radius: 4px; margin: 11px 0 8px; overflow: hidden; }
+  .bar > span {
+    display: block; height: 100%; width: 0%;
+    background: linear-gradient(90deg, var(--accent-d), var(--accent));
+    transition: width .4s ease;
+  }
+  .job.done .bar > span { background: var(--ok); }
+
+  .stats { display: flex; gap: 16px; font-family: var(--mono); font-size: 11.5px; color: var(--muted); }
+  .stats b { color: var(--text); font-weight: 600; }
+  .err { font-family: var(--mono); font-size: 11.5px; color: #e89aa0; white-space: pre-wrap; margin-top: 6px; }
+
+  .toast {
+    position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
+    background: var(--panel-2); border: 1px solid var(--line); color: var(--text);
+    padding: 10px 16px; border-radius: 8px; font-size: 13px; opacity: 0;
+    pointer-events: none; transition: opacity .2s ease;
+  }
+  .toast.show { opacity: 1; }
+
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1 class="mark">RT&nbsp;Grabber<span class="dot">.</span></h1>
+    <span class="tag" id="pills"></span>
+  </header>
+  <p class="sub">Paste IA Links, archive.org pages, or YouTube URLs. Files land in your chosen folder, organized for Jellyfin with thumbnails.</p>
+
+  <div class="panel">
+    <label class="label" for="folder">Download folder (on this computer)</label>
+    <div class="folder-row">
+      <input type="text" id="folder" spellcheck="false" placeholder="C:\Users\you\Videos\RoosterTeeth" />
+      <button id="saveFolder">Save</button>
+    </div>
+  </div>
+
+  <div class="panel">
+    <label class="label" for="urls">URLs — one per line</label>
+    <textarea id="urls" spellcheck="false" placeholder="https://archive.org/details/...&#10;https://www.youtube.com/watch?v=..."></textarea>
+    <div class="row spread" style="margin-top:13px;">
+      <span class="tag" id="hint">Downloads run one at a time.</span>
+      <button class="primary" id="start">Start downloads</button>
+    </div>
+  </div>
+
+  <h2 class="section">Transfers <button class="clear-btn" id="clear">Clear finished</button></h2>
+  <div id="jobs"><div class="empty">No transfers yet.</div></div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+
+function toast(msg) {
+  const t = $("toast");
+  t.textContent = msg; t.classList.add("show");
+  clearTimeout(t._t); t._t = setTimeout(() => t.classList.remove("show"), 2600);
+}
+
+async function loadConfig() {
+  try {
+    const r = await fetch("/api/config");
+    const c = await r.json();
+    $("folder").value = c.output_dir;
+    const pills = [];
+    pills.push(`<span class="pill ${c.yt_dlp_ok ? "good" : "bad"}">yt-dlp ${c.yt_dlp_ok ? "ready" : "missing"}</span>`);
+    pills.push(`<span class="pill ${c.ffmpeg_ok ? "good" : "bad"}">ffmpeg ${c.ffmpeg_ok ? "ready" : "missing"}</span>`);
+    $("pills").innerHTML = pills.join("");
+  } catch (e) { toast("Couldn't reach the server."); }
+}
+
+$("saveFolder").onclick = async () => {
+  const output_dir = $("folder").value.trim();
+  const r = await fetch("/api/config", {
+    method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({ output_dir }),
+  });
+  if (r.ok) { toast("Folder saved."); }
+  else { const e = await r.json(); toast(e.detail || "Couldn't save folder."); }
+};
+
+$("start").onclick = async () => {
+  const urls = $("urls").value.split("\n").map(s => s.trim()).filter(Boolean);
+  if (!urls.length) { toast("Add at least one URL."); return; }
+  const btn = $("start"); btn.disabled = true;
+  try {
+    const r = await fetch("/api/download", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({ urls }),
+    });
+    if (r.ok) { $("urls").value = ""; toast(`Queued ${urls.length} item${urls.length > 1 ? "s" : ""}.`); refresh(); }
+    else { const e = await r.json(); toast(e.detail || "Couldn't queue downloads."); }
+  } finally { btn.disabled = false; }
+};
+
+$("clear").onclick = async () => { await fetch("/api/jobs/clear", { method: "POST" }); refresh(); };
+
+function row(j) {
+  const title = j.title || "Resolving…";
+  const counter = (j.total && j.total > 1) ? ` · item ${j.current || 0}/${j.total}` : "";
+  const pct = j.percent != null ? j.percent : 0;
+  const stats = j.status === "running"
+    ? `<div class="stats"><span><b>${j.percent_str || pct.toFixed(0)+"%"}</b></span>${j.speed ? `<span>${j.speed}</span>` : ""}${j.eta ? `<span>ETA ${j.eta}</span>` : ""}</div>`
+    : "";
+  const err = j.status === "error" && j.error ? `<div class="err">${escapeHtml(j.error)}</div>` : "";
+  return `<div class="job ${j.status}">
+    <div class="job-top">
+      <div>
+        <div class="job-title">${escapeHtml(title)}${counter}</div>
+        <div class="job-url">${escapeHtml(j.url)}</div>
+      </div>
+      <div class="job-state ${j.status}">${j.status}</div>
+    </div>
+    <div class="bar"><span style="width:${Math.max(0, Math.min(100, pct))}%"></span></div>
+    ${stats}${err}
+  </div>`;
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c]));
+}
+
+async function refresh() {
+  try {
+    const r = await fetch("/api/jobs");
+    const { jobs } = await r.json();
+    const el = $("jobs");
+    if (!jobs.length) { el.innerHTML = `<div class="empty">No transfers yet.</div>`; return; }
+    el.innerHTML = jobs.map(row).join("");
+  } catch (e) { /* keep last render on transient errors */ }
+}
+
+loadConfig();
+refresh();
+setInterval(refresh, 1000);
+</script>
+</body>
+</html>

@@ -1,0 +1,29 @@
+services:
+  rt-grabber:
+    # Repository deploy (Portainer "Stacks -> Add stack -> Repository", or
+    # `docker compose up -d` on the host) builds from the included Dockerfile:
+    build: .
+    # Web-editor deploy instead? Comment out "build: ." above, build the image
+    # once on the host (`docker build -t rt-grabber .`), then use:
+    # image: rt-grabber:latest
+    container_name: rt-grabber
+    restart: unless-stopped
+    ports:
+      - "8765:8765"
+    environment:
+      OUTPUT_DIR: /downloads
+      CONFIG_DIR: /config
+    # Unraid: run as nobody:users (99:100) so downloaded files match your
+    # media share ownership and Jellyfin can read them. Adjust if needed.
+    user: "99:100"
+    volumes:
+      # LEFT = host path (edit these). RIGHT = in-container path (leave as-is).
+      # Point /downloads at the same share your Jellyfin library reads.
+      - /mnt/user/media/RoosterTeeth:/downloads
+      # Pre-create this appdata folder first so it's owned by 99:100, not root.
+      - /mnt/user/appdata/rt-grabber:/config
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/api/config')"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
