@@ -185,20 +185,16 @@ def run_job(job_id: str) -> None:
         stage_dir: Path | None = SMB_STAGE_DIR / job_id
         stage_dir.mkdir(parents=True, exist_ok=True)
         out_dir = str(stage_dir)
-        archive_db = str(CONFIG_DIR / ".downloaded.txt")
     else:
         stage_dir = None
         out_dir = config["output_dir"]
         Path(out_dir).mkdir(parents=True, exist_ok=True)
-        archive_db = str(Path(out_dir) / ".downloaded.txt")
 
     cmd = [
         YT_DLP,
         "--newline",
         "--progress-template", PROGRESS_TEMPLATE,
-        "--download-archive", archive_db,
         "--ignore-errors",
-        "--no-overwrites",
         "--embed-thumbnail",
         "--convert-thumbnails", "jpg",
         "--merge-output-format", "mkv",
