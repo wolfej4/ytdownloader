@@ -15,6 +15,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.request
 import uuid
 from pathlib import Path
 
@@ -134,12 +135,41 @@ jobs_lock = threading.Lock()
 work_queue: "queue.Queue[str]" = queue.Queue()
 
 ITEM_RE = re.compile(r"Downloading item (\d+) of (\d+)")
+IA_ID_RE = re.compile(r"archive\.org/(?:details|download)/([^/?&#]+)")
 
 
 def _set(job_id: str, **fields) -> None:
     with jobs_lock:
         if job_id in jobs:
             jobs[job_id].update(fields)
+
+
+def _apply_ia_thumbnail(out_dir: Path, url: str) -> None:
+    """Fetch the Internet Archive item thumbnail and embed it into every mkv in out_dir."""
+    m = IA_ID_RE.search(url)
+    if not m:
+        return
+    thumb_url = f"https://archive.org/services/img/{m.group(1)}"
+    thumb_path = out_dir / ".ia_thumb.jpg"
+    try:
+        with urllib.request.urlopen(thumb_url) as resp:
+            thumb_path.write_bytes(resp.read())
+        for mkv in out_dir.glob("**/*.mkv"):
+            tmp = mkv.with_name(f".tmp_{mkv.name}")
+            r = subprocess.run(
+                ["ffmpeg", "-i", str(mkv), "-i", str(thumb_path),
+                 "-map", "0", "-map", "1", "-c", "copy",
+                 "-disposition:v:1", "attached_pic", str(tmp), "-y"],
+                capture_output=True,
+            )
+            if r.returncode == 0:
+                tmp.replace(mkv)
+            elif tmp.exists():
+                tmp.unlink()
+    except Exception:
+        pass
+    finally:
+        thumb_path.unlink(missing_ok=True)
 
 
 def run_job(job_id: str) -> None:
@@ -216,6 +246,7 @@ def run_job(job_id: str) -> None:
 
     proc.wait()
     if proc.returncode == 0:
+        _apply_ia_thumbnail(Path(out_dir), job["url"])
         if use_smb and stage_dir:
             _set(job_id, status="uploading", percent=100.0, percent_str="100%")
             try:
