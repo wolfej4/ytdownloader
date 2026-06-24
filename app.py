@@ -274,7 +274,10 @@ def worker() -> None:
             work_queue.task_done()
 
 
-threading.Thread(target=worker, daemon=True).start()
+MAX_WORKERS = 3
+
+for _ in range(MAX_WORKERS):
+    threading.Thread(target=worker, daemon=True).start()
 
 # --------------------------------------------------------------------------
 # API
