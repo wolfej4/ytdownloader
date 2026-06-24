@@ -2,3 +2,4 @@ fastapi
 uvicorn[standard]
 aiofiles
 yt-dlp
+smbprotocol
