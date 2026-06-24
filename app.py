@@ -66,6 +66,58 @@ def save_config(cfg: dict) -> None:
 config = load_config()
 
 # --------------------------------------------------------------------------
+# SMB
+# --------------------------------------------------------------------------
+SMB_MOUNT_POINT = "/mnt/smb"
+_smb_connected = False
+_smb_lock = threading.Lock()
+
+
+def _is_mounted() -> bool:
+    try:
+        return subprocess.run(
+            ["mountpoint", "-q", SMB_MOUNT_POINT], capture_output=True
+        ).returncode == 0
+    except FileNotFoundError:
+        return False
+
+
+def _do_mount(host: str, share: str, username: str, password: str, domain: str) -> None:
+    Path(SMB_MOUNT_POINT).mkdir(parents=True, exist_ok=True)
+    opts = f"username={username},password={password},uid=99,gid=100,file_mode=0664,dir_mode=0775"
+    if domain:
+        opts += f",domain={domain}"
+    r = subprocess.run(
+        ["mount", "-t", "cifs", f"//{host}/{share}", SMB_MOUNT_POINT, "-o", opts],
+        capture_output=True, text=True,
+    )
+    if r.returncode != 0:
+        raise RuntimeError(r.stderr.strip() or f"mount exited {r.returncode}")
+
+
+def _do_unmount() -> None:
+    r = subprocess.run(["umount", SMB_MOUNT_POINT], capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError(r.stderr.strip() or f"umount exited {r.returncode}")
+
+
+def _try_auto_mount() -> None:
+    global _smb_connected
+    smb = config.get("smb")
+    if not smb or not smb.get("host"):
+        return
+    try:
+        if not _is_mounted():
+            _do_mount(smb["host"], smb["share"], smb["username"], smb["password"], smb.get("domain", ""))
+        with _smb_lock:
+            _smb_connected = True
+    except Exception as exc:
+        print(f"[SMB] Auto-mount failed: {exc}", file=sys.stderr)
+
+
+_try_auto_mount()
+
+# --------------------------------------------------------------------------
 # Job store + worker queue
 # --------------------------------------------------------------------------
 jobs: dict[str, dict] = {}
@@ -184,10 +236,22 @@ class ConfigRequest(BaseModel):
 
 @app.get("/api/config")
 def get_config() -> dict:
+    with _smb_lock:
+        connected = _smb_connected
+    smb = config.get("smb", {})
     return {
         "output_dir": config["output_dir"],
         "yt_dlp_ok": shutil.which(YT_DLP) is not None,
         "ffmpeg_ok": shutil.which("ffmpeg") is not None,
+        "smb_connected": connected,
+        "smb": {
+            "host": smb.get("host", ""),
+            "share": smb.get("share", ""),
+            "username": smb.get("username", ""),
+            "password": smb.get("password", ""),
+            "domain": smb.get("domain", ""),
+            "subdir": smb.get("subdir", ""),
+        },
     }
 
 
@@ -238,6 +302,60 @@ def clear_finished() -> dict:
         for jid in [j["id"] for j in jobs.values() if j["status"] in ("done", "error")]:
             del jobs[jid]
     return {"ok": True}
+
+
+class SmbConnectRequest(BaseModel):
+    host: str
+    share: str
+    username: str
+    password: str
+    domain: str = ""
+    subdir: str = ""
+
+
+@app.post("/api/smb/connect")
+def smb_connect(req: SmbConnectRequest) -> dict:
+    global _smb_connected
+    host = req.host.strip()
+    share = req.share.strip()
+    if not host or not share:
+        raise HTTPException(400, "Host and share are required.")
+    if _is_mounted():
+        try:
+            _do_unmount()
+        except Exception:
+            pass
+    try:
+        _do_mount(host, share, req.username, req.password, req.domain)
+    except RuntimeError as exc:
+        raise HTTPException(400, f"Mount failed: {exc}")
+    with _smb_lock:
+        _smb_connected = True
+    subdir = req.subdir.strip().lstrip("/")
+    mount_path = SMB_MOUNT_POINT if not subdir else str(Path(SMB_MOUNT_POINT) / subdir)
+    config["smb"] = {
+        "host": host, "share": share, "username": req.username,
+        "password": req.password, "domain": req.domain, "subdir": subdir,
+    }
+    config["output_dir"] = mount_path
+    save_config(config)
+    return {"connected": True, "output_dir": mount_path}
+
+
+@app.post("/api/smb/disconnect")
+def smb_disconnect() -> dict:
+    global _smb_connected
+    if _is_mounted():
+        try:
+            _do_unmount()
+        except RuntimeError as exc:
+            raise HTTPException(400, f"Unmount failed: {exc}")
+    with _smb_lock:
+        _smb_connected = False
+    config.pop("smb", None)
+    config["output_dir"] = DEFAULT_OUTPUT
+    save_config(config)
+    return {"connected": False, "output_dir": config["output_dir"]}
 
 
 @app.get("/")

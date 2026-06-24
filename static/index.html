@@ -46,7 +46,7 @@
     letter-spacing: 0.12em; text-transform: uppercase; color: var(--muted);
     margin-bottom: 8px;
   }
-  textarea, input[type=text] {
+  textarea, input[type=text], input[type=password] {
     width: 100%; background: var(--bg); color: var(--text);
     border: 1px solid var(--line); border-radius: 7px; padding: 12px 13px;
     font-family: var(--mono); font-size: 13.5px; resize: vertical;
@@ -76,6 +76,9 @@
 
   .folder-row { display: flex; gap: 10px; }
   .folder-row input { flex: 1; }
+
+  .smb-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  @media (max-width: 520px) { .smb-grid { grid-template-columns: 1fr; } }
 
   h2.section {
     font-size: 12px; font-family: var(--mono); letter-spacing: 0.14em;
@@ -151,6 +154,39 @@
   </div>
 
   <div class="panel">
+    <div class="row spread" style="margin-bottom:14px">
+      <span class="label" style="margin:0">SMB Network Share</span>
+      <span id="smbStatus" class="pill">Not connected</span>
+    </div>
+    <div class="smb-grid">
+      <div>
+        <span class="label">Host</span>
+        <input type="text" id="smbHost" spellcheck="false" placeholder="192.168.1.100" />
+      </div>
+      <div>
+        <span class="label">Share</span>
+        <input type="text" id="smbShare" spellcheck="false" placeholder="media" />
+      </div>
+      <div>
+        <span class="label">Username</span>
+        <input type="text" id="smbUser" spellcheck="false" autocomplete="off" placeholder="user" />
+      </div>
+      <div>
+        <span class="label">Password</span>
+        <input type="password" id="smbPass" autocomplete="off" placeholder="••••••" />
+      </div>
+    </div>
+    <div style="margin-top:10px">
+      <span class="label">Subdirectory on share (optional)</span>
+      <input type="text" id="smbSubdir" spellcheck="false" placeholder="RoosterTeeth" />
+    </div>
+    <div class="row" style="margin-top:13px;gap:8px">
+      <button class="primary" id="smbConnect">Connect</button>
+      <button id="smbDisconnect">Disconnect</button>
+    </div>
+  </div>
+
+  <div class="panel">
     <label class="label" for="urls">URLs — one per line</label>
     <textarea id="urls" spellcheck="false" placeholder="https://archive.org/details/...&#10;https://www.youtube.com/watch?v=..."></textarea>
     <div class="row spread" style="margin-top:13px;">
@@ -183,8 +219,53 @@ async function loadConfig() {
     pills.push(`<span class="pill ${c.yt_dlp_ok ? "good" : "bad"}">yt-dlp ${c.yt_dlp_ok ? "ready" : "missing"}</span>`);
     pills.push(`<span class="pill ${c.ffmpeg_ok ? "good" : "bad"}">ffmpeg ${c.ffmpeg_ok ? "ready" : "missing"}</span>`);
     $("pills").innerHTML = pills.join("");
+    updateSmb(c);
   } catch (e) { toast("Couldn't reach the server."); }
 }
+
+function updateSmb(c) {
+  const ok = c.smb_connected;
+  const smb = c.smb || {};
+  $("smbStatus").textContent = ok ? `Connected — //${smb.host}/${smb.share}` : "Not connected";
+  $("smbStatus").className = `pill ${ok ? "good" : ""}`;
+  $("smbConnect").style.display = ok ? "none" : "";
+  $("smbDisconnect").style.display = ok ? "" : "none";
+  if (!ok) {
+    if (smb.host)    $("smbHost").value   = smb.host;
+    if (smb.share)   $("smbShare").value  = smb.share;
+    if (smb.username)$("smbUser").value   = smb.username;
+    if (smb.subdir)  $("smbSubdir").value = smb.subdir;
+  }
+}
+
+$("smbConnect").onclick = async () => {
+  const btn = $("smbConnect"); btn.disabled = true;
+  try {
+    const r = await fetch("/api/smb/connect", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({
+        host: $("smbHost").value.trim(),
+        share: $("smbShare").value.trim(),
+        username: $("smbUser").value,
+        password: $("smbPass").value,
+        subdir: $("smbSubdir").value.trim(),
+      }),
+    });
+    const d = await r.json();
+    if (r.ok) { toast("Connected to SMB share."); $("folder").value = d.output_dir; loadConfig(); }
+    else { toast(d.detail || "Connection failed."); }
+  } finally { btn.disabled = false; }
+};
+
+$("smbDisconnect").onclick = async () => {
+  const btn = $("smbDisconnect"); btn.disabled = true;
+  try {
+    const r = await fetch("/api/smb/disconnect", { method: "POST" });
+    const d = await r.json();
+    if (r.ok) { toast("Disconnected."); $("folder").value = d.output_dir; loadConfig(); }
+    else { toast(d.detail || "Disconnect failed."); }
+  } finally { btn.disabled = false; }
+};
 
 $("saveFolder").onclick = async () => {
   const output_dir = $("folder").value.trim();
