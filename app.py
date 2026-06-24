@@ -18,6 +18,8 @@ import time
 import uuid
 from pathlib import Path
 
+import smbclient
+
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -66,62 +68,63 @@ def save_config(cfg: dict) -> None:
 config = load_config()
 
 # --------------------------------------------------------------------------
-# SMB
+# SMB  (pure-Python SMB2/3 via smbprotocol — no kernel mount needed)
 # --------------------------------------------------------------------------
-SMB_MOUNT_POINT = "/mnt/smb"
+SMB_STAGE_DIR = Path("/tmp/rtgrabber-stage")
+_smb_state: dict = {}
 _smb_connected = False
 _smb_lock = threading.Lock()
 
 
-def _is_mounted() -> bool:
-    try:
-        return subprocess.run(
-            ["mountpoint", "-q", SMB_MOUNT_POINT], capture_output=True
-        ).returncode == 0
-    except FileNotFoundError:
-        return False
+def _smb_unc(*parts: str) -> str:
+    """Return a UNC path rooted at the configured share + optional subdir."""
+    segs = [f"\\\\{_smb_state['host']}\\{_smb_state['share']}"]
+    subdir = _smb_state.get("subdir", "").strip("/\\")
+    if subdir:
+        segs.extend(subdir.replace("/", "\\").split("\\"))
+    for p in parts:
+        p = p.strip("/\\").replace("/", "\\")
+        if p and p != ".":
+            segs.extend(p.split("\\"))
+    return "\\".join(segs)
 
 
-def _do_mount(host: str, share: str, username: str, password: str, domain: str) -> None:
-    Path(SMB_MOUNT_POINT).mkdir(parents=True, exist_ok=True)
-    try:
-        subprocess.run(["/sbin/modprobe", "cifs"], capture_output=True)
-    except FileNotFoundError:
-        pass  # modprobe unavailable; cifs module may already be loaded
-    opts = f"username={username},password={password},uid=99,gid=100,file_mode=0664,dir_mode=0775,vers=3.0"
+def _smb_open_session(host: str, share: str, username: str, password: str, domain: str) -> None:
+    smbclient.reset_connection_cache()
+    kw: dict = {"username": username, "password": password}
     if domain:
-        opts += f",domain={domain}"
-    r = subprocess.run(
-        ["mount.cifs", f"//{host}/{share}", SMB_MOUNT_POINT, "-o", opts],
-        capture_output=True, text=True,
-    )
-    if r.returncode != 0:
-        raise RuntimeError(r.stderr.strip() or r.stdout.strip() or f"mount.cifs exited {r.returncode}")
-    if not _is_mounted():
-        raise RuntimeError("mount.cifs exited 0 but share is not mounted — check host/share name")
+        kw["domain"] = domain
+    smbclient.register_session(host, **kw)
+    smbclient.stat(f"\\\\{host}\\{share}")  # raises if share is unreachable / auth fails
 
 
-def _do_unmount() -> None:
-    r = subprocess.run(["umount", SMB_MOUNT_POINT], capture_output=True, text=True)
-    if r.returncode != 0:
-        raise RuntimeError(r.stderr.strip() or f"umount exited {r.returncode}")
+def _copy_to_smb(local_dir: Path) -> None:
+    smbclient.makedirs(_smb_unc(), exist_ok=True)
+    for src in local_dir.rglob("*"):
+        if not src.is_file():
+            continue
+        rel = src.relative_to(local_dir)
+        if rel.parent != Path("."):
+            smbclient.makedirs(_smb_unc(str(rel.parent)), exist_ok=True)
+        with src.open("rb") as fsrc, smbclient.open_file(_smb_unc(str(rel)), mode="wb") as fdst:
+            shutil.copyfileobj(fsrc, fdst)
 
 
-def _try_auto_mount() -> None:
-    global _smb_connected
+def _try_auto_connect() -> None:
+    global _smb_connected, _smb_state
     smb = config.get("smb")
     if not smb or not smb.get("host"):
         return
     try:
-        if not _is_mounted():
-            _do_mount(smb["host"], smb["share"], smb["username"], smb["password"], smb.get("domain", ""))
+        _smb_open_session(smb["host"], smb["share"], smb["username"], smb["password"], smb.get("domain", ""))
         with _smb_lock:
+            _smb_state = dict(smb)
             _smb_connected = True
     except Exception as exc:
-        print(f"[SMB] Auto-mount failed: {exc}", file=sys.stderr)
+        print(f"[SMB] Auto-connect failed: {exc}", file=sys.stderr)
 
 
-_try_auto_mount()
+_try_auto_connect()
 
 # --------------------------------------------------------------------------
 # Job store + worker queue
@@ -145,9 +148,19 @@ def run_job(job_id: str) -> None:
     if not job:
         return
 
-    out_dir = config["output_dir"]
-    Path(out_dir).mkdir(parents=True, exist_ok=True)
-    archive_db = str(Path(out_dir) / ".downloaded.txt")
+    with _smb_lock:
+        use_smb = _smb_connected
+
+    if use_smb:
+        stage_dir: Path | None = SMB_STAGE_DIR / job_id
+        stage_dir.mkdir(parents=True, exist_ok=True)
+        out_dir = str(stage_dir)
+        archive_db = str(CONFIG_DIR / ".downloaded.txt")
+    else:
+        stage_dir = None
+        out_dir = config["output_dir"]
+        Path(out_dir).mkdir(parents=True, exist_ok=True)
+        archive_db = str(Path(out_dir) / ".downloaded.txt")
 
     cmd = [
         YT_DLP,
@@ -206,11 +219,24 @@ def run_job(job_id: str) -> None:
 
     proc.wait()
     if proc.returncode == 0:
-        _set(job_id, status="done", percent=100.0, percent_str="100%",
-             finished=time.time())
+        if use_smb and stage_dir:
+            _set(job_id, status="uploading", percent=100.0, percent_str="100%")
+            try:
+                _copy_to_smb(stage_dir)
+                _set(job_id, status="done", finished=time.time())
+            except Exception as exc:
+                _set(job_id, status="error", finished=time.time(),
+                     error=f"SMB upload failed: {exc}")
+            finally:
+                shutil.rmtree(stage_dir, ignore_errors=True)
+        else:
+            _set(job_id, status="done", percent=100.0, percent_str="100%",
+                 finished=time.time())
     else:
         _set(job_id, status="error", finished=time.time(),
              error="\n".join(tail[-6:]) or f"yt-dlp exited with code {proc.returncode}")
+        if stage_dir:
+            shutil.rmtree(stage_dir, ignore_errors=True)
 
 
 def worker() -> None:
@@ -321,43 +347,35 @@ class SmbConnectRequest(BaseModel):
 
 @app.post("/api/smb/connect")
 def smb_connect(req: SmbConnectRequest) -> dict:
-    global _smb_connected
+    global _smb_connected, _smb_state
     host = req.host.strip()
     share = req.share.strip()
     if not host or not share:
         raise HTTPException(400, "Host and share are required.")
-    if _is_mounted():
-        try:
-            _do_unmount()
-        except Exception:
-            pass
     try:
-        _do_mount(host, share, req.username, req.password, req.domain)
-    except RuntimeError as exc:
-        raise HTTPException(400, f"Mount failed: {exc}")
+        _smb_open_session(host, share, req.username, req.password, req.domain)
+    except Exception as exc:
+        raise HTTPException(400, f"Connection failed: {exc}")
+    subdir = req.subdir.strip().strip("/\\")
     with _smb_lock:
+        _smb_state = {
+            "host": host, "share": share, "username": req.username,
+            "password": req.password, "domain": req.domain, "subdir": subdir,
+        }
         _smb_connected = True
-    subdir = req.subdir.strip().lstrip("/")
-    mount_path = SMB_MOUNT_POINT if not subdir else str(Path(SMB_MOUNT_POINT) / subdir)
-    config["smb"] = {
-        "host": host, "share": share, "username": req.username,
-        "password": req.password, "domain": req.domain, "subdir": subdir,
-    }
-    config["output_dir"] = mount_path
+    config["smb"] = dict(_smb_state)
+    config["output_dir"] = f"//{host}/{share}/{subdir}".rstrip("/")
     save_config(config)
-    return {"connected": True, "output_dir": mount_path}
+    return {"connected": True, "output_dir": config["output_dir"]}
 
 
 @app.post("/api/smb/disconnect")
 def smb_disconnect() -> dict:
-    global _smb_connected
-    if _is_mounted():
-        try:
-            _do_unmount()
-        except RuntimeError as exc:
-            raise HTTPException(400, f"Unmount failed: {exc}")
+    global _smb_connected, _smb_state
+    smbclient.reset_connection_cache()
     with _smb_lock:
         _smb_connected = False
+        _smb_state = {}
     config.pop("smb", None)
     config["output_dir"] = DEFAULT_OUTPUT
     save_config(config)
