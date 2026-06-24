@@ -74,9 +74,6 @@
   .pill.good { color: var(--ok); border-color: #38492c; }
   .pill.bad  { color: var(--accent); border-color: var(--accent-d); }
 
-  .folder-row { display: flex; gap: 10px; }
-  .folder-row input { flex: 1; }
-
   .smb-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
   @media (max-width: 520px) { .smb-grid { grid-template-columns: 1fr; } }
 
@@ -146,14 +143,6 @@
   <p class="sub">Paste IA Links, archive.org pages, or YouTube URLs. Files land in your chosen folder, organized for Jellyfin with thumbnails.</p>
 
   <div class="panel">
-    <label class="label" for="folder">Download folder (on this computer)</label>
-    <div class="folder-row">
-      <input type="text" id="folder" spellcheck="false" placeholder="C:\Users\you\Videos\RoosterTeeth" />
-      <button id="saveFolder">Save</button>
-    </div>
-  </div>
-
-  <div class="panel">
     <div class="row spread" style="margin-bottom:14px">
       <span class="label" style="margin:0">SMB Network Share</span>
       <span id="smbStatus" class="pill">Not connected</span>
@@ -214,7 +203,6 @@ async function loadConfig() {
   try {
     const r = await fetch("/api/config");
     const c = await r.json();
-    $("folder").value = c.output_dir;
     const pills = [];
     pills.push(`<span class="pill ${c.yt_dlp_ok ? "good" : "bad"}">yt-dlp ${c.yt_dlp_ok ? "ready" : "missing"}</span>`);
     pills.push(`<span class="pill ${c.ffmpeg_ok ? "good" : "bad"}">ffmpeg ${c.ffmpeg_ok ? "ready" : "missing"}</span>`);
@@ -252,7 +240,7 @@ $("smbConnect").onclick = async () => {
       }),
     });
     const d = await r.json();
-    if (r.ok) { toast("Connected to SMB share."); $("folder").value = d.output_dir; loadConfig(); }
+    if (r.ok) { toast("Connected to SMB share."); loadConfig(); }
     else { toast(d.detail || "Connection failed."); }
   } finally { btn.disabled = false; }
 };
@@ -262,19 +250,9 @@ $("smbDisconnect").onclick = async () => {
   try {
     const r = await fetch("/api/smb/disconnect", { method: "POST" });
     const d = await r.json();
-    if (r.ok) { toast("Disconnected."); $("folder").value = d.output_dir; loadConfig(); }
+    if (r.ok) { toast("Disconnected."); loadConfig(); }
     else { toast(d.detail || "Disconnect failed."); }
   } finally { btn.disabled = false; }
-};
-
-$("saveFolder").onclick = async () => {
-  const output_dir = $("folder").value.trim();
-  const r = await fetch("/api/config", {
-    method: "POST", headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({ output_dir }),
-  });
-  if (r.ok) { toast("Folder saved."); }
-  else { const e = await r.json(); toast(e.detail || "Couldn't save folder."); }
 };
 
 $("start").onclick = async () => {
