@@ -2,8 +2,10 @@ FROM python:3.12-slim
 
 # ffmpeg is required for thumbnail embedding/conversion and metadata.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ffmpeg \
+ && apt-get install -y --no-install-recommends ffmpeg cifs-utils \
  && rm -rf /var/lib/apt/lists/*
+
+RUN mkdir -p /mnt/smb
 
 WORKDIR /app
 
