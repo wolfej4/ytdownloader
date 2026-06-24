@@ -84,7 +84,10 @@ def _is_mounted() -> bool:
 
 def _do_mount(host: str, share: str, username: str, password: str, domain: str) -> None:
     Path(SMB_MOUNT_POINT).mkdir(parents=True, exist_ok=True)
-    subprocess.run(["modprobe", "cifs"], capture_output=True)  # load kernel module if not already present
+    try:
+        subprocess.run(["/sbin/modprobe", "cifs"], capture_output=True)
+    except FileNotFoundError:
+        pass  # modprobe unavailable; cifs module may already be loaded
     opts = f"username={username},password={password},uid=99,gid=100,file_mode=0664,dir_mode=0775,vers=3.0"
     if domain:
         opts += f",domain={domain}"
