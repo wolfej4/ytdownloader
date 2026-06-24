@@ -13,10 +13,10 @@ services:
     environment:
       OUTPUT_DIR: /downloads
       CONFIG_DIR: /config
-    # SYS_ADMIN is required for mount.cifs (SMB). If you don't use SMB you
-    # can remove cap_add and uncomment user: "99:100" instead.
-    cap_add:
-      - SYS_ADMIN
+    # privileged is required for mount.cifs (SMB) — Docker's seccomp profile
+    # blocks the capset syscall that mount.cifs uses internally even with
+    # SYS_ADMIN alone. Safe for a local home-server deployment.
+    privileged: true
     volumes:
       # LEFT = host path (edit these). RIGHT = in-container path (leave as-is).
       # Point /downloads at the same share your Jellyfin library reads.
