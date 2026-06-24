@@ -13,13 +13,9 @@ services:
     environment:
       OUTPUT_DIR: /downloads
       CONFIG_DIR: /config
-    # Run as nobody:users so downloaded files match your media share ownership.
-    user: "99:100"
     volumes:
       # LEFT = host path (edit these). RIGHT = in-container path (leave as-is).
-      # Point /downloads at the same share your Jellyfin library reads.
       - /mnt/user/media/RoosterTeeth:/downloads
-      # Pre-create this appdata folder first so it's owned by 99:100, not root.
       - /mnt/user/appdata/rt-grabber:/config
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/api/config')"]
