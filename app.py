@@ -169,8 +169,10 @@ def run_job(job_id: str) -> None:
         "--download-archive", archive_db,
         "--ignore-errors",
         "--no-overwrites",
+        "--embed-thumbnail",
+        "--convert-thumbnails", "jpg",
         "--merge-output-format", "mkv",
-        "-o", "%(title).200B [%(id)s]/%(title).200B [%(id)s].%(ext)s",
+        "-o", "%(title).200B [%(id)s].%(ext)s",
         "-P", out_dir,
         job["url"],
     ]
