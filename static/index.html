@@ -46,11 +46,12 @@
     letter-spacing: 0.12em; text-transform: uppercase; color: var(--muted);
     margin-bottom: 8px;
   }
-  textarea, input[type=text], input[type=password] {
+  textarea, input[type=text], input[type=password], input[type=number] {
     width: 100%; background: var(--bg); color: var(--text);
     border: 1px solid var(--line); border-radius: 7px; padding: 12px 13px;
     font-family: var(--mono); font-size: 13.5px; resize: vertical;
   }
+  input[type=number] { width: auto; min-width: 80px; }
   textarea { min-height: 132px; }
   textarea:focus, input:focus { outline: 2px solid var(--accent); outline-offset: 1px; border-color: transparent; }
 
@@ -80,8 +81,9 @@
   h2.section {
     font-size: 12px; font-family: var(--mono); letter-spacing: 0.14em;
     text-transform: uppercase; color: var(--muted); margin: 30px 0 12px;
-    display: flex; justify-content: space-between; align-items: center;
+    display: flex; justify-content: space-between; align-items: center; gap: 8px;
   }
+  .section-btns { display: flex; gap: 6px; }
   .clear-btn { font-size: 12px; padding: 5px 11px; }
 
   .empty {
@@ -94,24 +96,38 @@
     border-left: 3px solid var(--line);
     border-radius: 8px; padding: 13px 15px; margin-bottom: 10px;
   }
-  .job.running   { border-left-color: var(--accent); }
-  .job.uploading { border-left-color: var(--warn); }
-  .job.done      { border-left-color: var(--ok); }
-  .job.error     { border-left-color: var(--accent); }
-  .job.queued    { border-left-color: var(--warn); }
+  .job.running    { border-left-color: var(--accent); }
+  .job.uploading  { border-left-color: var(--warn); }
+  .job.done       { border-left-color: var(--ok); }
+  .job.error      { border-left-color: var(--accent); }
+  .job.queued     { border-left-color: var(--warn); }
+  .job.cancelled  { border-left-color: var(--muted); }
 
   .job-top { display: flex; justify-content: space-between; gap: 12px; align-items: baseline; }
   .job-title { font-size: 14px; font-weight: 600; word-break: break-word; }
   .job-url { font-family: var(--mono); font-size: 11px; color: var(--muted); word-break: break-all; }
+  .job-right { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
   .job-state {
     font-family: var(--mono); font-size: 11px; letter-spacing: 0.1em;
     text-transform: uppercase; white-space: nowrap;
   }
-  .job-state.running   { color: var(--accent); }
-  .job-state.uploading { color: var(--warn); }
-  .job-state.done      { color: var(--ok); }
-  .job-state.error     { color: var(--accent); }
-  .job-state.queued    { color: var(--warn); }
+  .job-state.running    { color: var(--accent); }
+  .job-state.uploading  { color: var(--warn); }
+  .job-state.done       { color: var(--ok); }
+  .job-state.error      { color: var(--accent); }
+  .job-state.queued     { color: var(--warn); }
+  .job-state.cancelled  { color: var(--muted); }
+
+  .job-btn {
+    font-size: 11px; padding: 3px 9px; border-radius: 5px;
+    font-family: var(--mono); cursor: pointer;
+    border: 1px solid var(--line); background: var(--panel-2); color: var(--muted);
+  }
+  .job-btn:hover { border-color: var(--muted); color: var(--text); }
+  .job-btn.cancel { color: var(--accent); border-color: var(--accent-d); }
+  .job-btn.cancel:hover { background: var(--accent-d); color: #fff; }
+  .job-btn.retry { color: var(--warn); border-color: #5a3e10; }
+  .job-btn.retry:hover { background: #3a2808; color: var(--warn); }
 
   .bar { height: 6px; background: var(--bg); border-radius: 4px; margin: 11px 0 8px; overflow: hidden; }
   .bar > span {
@@ -181,12 +197,22 @@
     <label class="label" for="urls">URLs — one per line</label>
     <textarea id="urls" spellcheck="false" placeholder="https://archive.org/details/...&#10;https://www.youtube.com/watch?v=..."></textarea>
     <div class="row spread" style="margin-top:13px;">
-      <span class="tag" id="hint">Up to 3 downloads run simultaneously.</span>
+      <div class="row" style="gap:8px">
+        <span class="label" style="margin:0">Workers</span>
+        <input type="number" id="workerCount" min="1" max="20" value="3" style="width:70px;min-width:unset;padding:8px 10px" />
+        <button id="saveWorkers" style="padding:8px 14px;font-size:13px">Save</button>
+      </div>
       <button class="primary" id="start">Start downloads</button>
     </div>
   </div>
 
-  <h2 class="section">Transfers <button class="clear-btn" id="clear">Clear finished</button></h2>
+  <h2 class="section">
+    Transfers
+    <span class="section-btns">
+      <button class="clear-btn" id="clearDone">Clear successful</button>
+      <button class="clear-btn" id="clear">Clear all</button>
+    </span>
+  </h2>
   <div id="jobs"><div class="empty">No transfers yet.</div></div>
 </div>
 
@@ -209,6 +235,7 @@ async function loadConfig() {
     pills.push(`<span class="pill ${c.yt_dlp_ok ? "good" : "bad"}">yt-dlp ${c.yt_dlp_ok ? "ready" : "missing"}</span>`);
     pills.push(`<span class="pill ${c.ffmpeg_ok ? "good" : "bad"}">ffmpeg ${c.ffmpeg_ok ? "ready" : "missing"}</span>`);
     $("pills").innerHTML = pills.join("");
+    if (c.max_workers) $("workerCount").value = c.max_workers;
     updateSmb(c);
   } catch (e) { toast("Couldn't reach the server."); }
 }
@@ -257,6 +284,21 @@ $("smbDisconnect").onclick = async () => {
   } finally { btn.disabled = false; }
 };
 
+$("saveWorkers").onclick = async () => {
+  const n = parseInt($("workerCount").value, 10);
+  if (!n || n < 1) { toast("Enter a number between 1 and 20."); return; }
+  const btn = $("saveWorkers"); btn.disabled = true;
+  try {
+    const r = await fetch("/api/workers", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({ max_workers: n }),
+    });
+    const d = await r.json();
+    if (r.ok) { $("workerCount").value = d.max_workers; toast(`Workers set to ${d.max_workers}.`); }
+    else { toast(d.detail || "Failed to update."); }
+  } finally { btn.disabled = false; }
+};
+
 $("start").onclick = async () => {
   const urls = $("urls").value.split("\n").map(s => s.trim()).filter(Boolean);
   if (!urls.length) { toast("Add at least one URL."); return; }
@@ -272,22 +314,51 @@ $("start").onclick = async () => {
 };
 
 $("clear").onclick = async () => { await fetch("/api/jobs/clear", { method: "POST" }); refresh(); };
+$("clearDone").onclick = async () => { await fetch("/api/jobs/clear/done", { method: "POST" }); refresh(); };
+
+// Event delegation for per-job buttons
+$("jobs").addEventListener("click", async (e) => {
+  const btn = e.target.closest("[data-action]");
+  if (!btn) return;
+  const { action, jobId } = btn.dataset;
+  btn.disabled = true;
+  try {
+    const r = await fetch(`/api/jobs/${jobId}/${action}`, { method: "POST" });
+    if (!r.ok) { const d = await r.json(); toast(d.detail || "Failed."); }
+    else { refresh(); }
+  } catch { toast("Request failed."); }
+  finally { btn.disabled = false; }
+});
 
 function row(j) {
   const title = j.title || "Resolving…";
   const counter = (j.total && j.total > 1) ? ` · item ${j.current || 0}/${j.total}` : "";
   const pct = j.percent != null ? j.percent : 0;
+  const active = ["queued", "running", "uploading"].includes(j.status);
+  const retryable = ["error", "cancelled"].includes(j.status);
+
+  const cancelBtn = active
+    ? `<button class="job-btn cancel" data-action="cancel" data-job-id="${j.id}">✕</button>`
+    : "";
+  const retryBtn = retryable
+    ? `<button class="job-btn retry" data-action="retry" data-job-id="${j.id}">Retry</button>`
+    : "";
+
   const stats = j.status === "running"
     ? `<div class="stats"><span><b>${j.percent_str || pct.toFixed(0)+"%"}</b></span>${j.speed ? `<span>${j.speed}</span>` : ""}${j.eta ? `<span>ETA ${j.eta}</span>` : ""}</div>`
     : "";
   const err = j.status === "error" && j.error ? `<div class="err">${escapeHtml(j.error)}</div>` : "";
+
   return `<div class="job ${j.status}">
     <div class="job-top">
       <div>
         <div class="job-title">${escapeHtml(title)}${counter}</div>
         <div class="job-url">${escapeHtml(j.url)}</div>
       </div>
-      <div class="job-state ${j.status}">${j.status}</div>
+      <div class="job-right">
+        ${cancelBtn}${retryBtn}
+        <div class="job-state ${j.status}">${j.status}</div>
+      </div>
     </div>
     <div class="bar"><span style="width:${Math.max(0, Math.min(100, pct))}%"></span></div>
     ${stats}${err}
