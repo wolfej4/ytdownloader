@@ -58,7 +58,7 @@ def load_config() -> dict:
             return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
         except Exception:
             pass
-    return {"output_dir": DEFAULT_OUTPUT}
+    return {"output_dir": DEFAULT_OUTPUT, "max_workers": 3}
 
 
 def save_config(cfg: dict) -> None:
@@ -67,6 +67,8 @@ def save_config(cfg: dict) -> None:
 
 
 config = load_config()
+if "max_workers" not in config:
+    config["max_workers"] = 3
 
 # --------------------------------------------------------------------------
 # SMB  (pure-Python SMB2/3 via smbprotocol — no kernel mount needed)
@@ -134,6 +136,14 @@ jobs: dict[str, dict] = {}
 jobs_lock = threading.Lock()
 work_queue: "queue.Queue[str]" = queue.Queue()
 
+# Tracks running subprocesses so we can cancel them
+_job_procs: dict[str, subprocess.Popen] = {}
+_job_procs_lock = threading.Lock()
+
+# Dynamic concurrency control
+_active = 0
+_active_cond = threading.Condition()
+
 ITEM_RE = re.compile(r"Downloading item (\d+) of (\d+)")
 IA_ID_RE = re.compile(r"archive\.org/(?:details|download)/([^/?&#]+)")
 
@@ -178,6 +188,10 @@ def run_job(job_id: str) -> None:
     if not job:
         return
 
+    # Check if cancelled before we even start
+    if job.get("status") == "cancelled":
+        return
+
     with _smb_lock:
         use_smb = _smb_connected
 
@@ -197,6 +211,7 @@ def run_job(job_id: str) -> None:
         "--ignore-errors",
         "--embed-thumbnail",
         "--convert-thumbnails", "jpg",
+        "--embed-metadata",
         "--merge-output-format", "mkv",
         "-o", "%(title).200B [%(id)s].%(ext)s",
         "-P", out_dir,
@@ -215,32 +230,48 @@ def run_job(job_id: str) -> None:
              error=f"Could not find '{YT_DLP}'. Install it and make sure it's on PATH.")
         return
 
-    for line in proc.stdout:  # type: ignore[union-attr]
-        line = line.rstrip("\n")
-        if not line:
-            continue
-        tail.append(line)
-        del tail[:-12]  # keep last 12 lines for error reporting
+    with _job_procs_lock:
+        _job_procs[job_id] = proc
 
-        if line.startswith(SENTINEL):
-            parts = line[len(SENTINEL):].split("|")
-            pct = (parts[0] if len(parts) > 0 else "").strip()
-            speed = (parts[1] if len(parts) > 1 else "").strip()
-            eta = (parts[2] if len(parts) > 2 else "").strip()
-            title = (parts[3] if len(parts) > 3 else "").strip()
-            num = None
-            try:
-                num = float(pct.replace("%", ""))
-            except ValueError:
-                pass
-            _set(job_id, percent=num, percent_str=pct, speed=speed,
-                 eta=eta, title=title or job.get("title"))
-        else:
-            m = ITEM_RE.search(line)
-            if m:
-                _set(job_id, current=int(m.group(1)), total=int(m.group(2)))
+    try:
+        for line in proc.stdout:  # type: ignore[union-attr]
+            line = line.rstrip("\n")
+            if not line:
+                continue
+            tail.append(line)
+            del tail[:-12]  # keep last 12 lines for error reporting
+
+            if line.startswith(SENTINEL):
+                parts = line[len(SENTINEL):].split("|")
+                pct = (parts[0] if len(parts) > 0 else "").strip()
+                speed = (parts[1] if len(parts) > 1 else "").strip()
+                eta = (parts[2] if len(parts) > 2 else "").strip()
+                title = (parts[3] if len(parts) > 3 else "").strip()
+                num = None
+                try:
+                    num = float(pct.replace("%", ""))
+                except ValueError:
+                    pass
+                _set(job_id, percent=num, percent_str=pct, speed=speed,
+                     eta=eta, title=title or job.get("title"))
+            else:
+                m = ITEM_RE.search(line)
+                if m:
+                    _set(job_id, current=int(m.group(1)), total=int(m.group(2)))
+    finally:
+        with _job_procs_lock:
+            _job_procs.pop(job_id, None)
 
     proc.wait()
+
+    # Check if cancelled mid-run
+    with jobs_lock:
+        current_status = jobs.get(job_id, {}).get("status")
+    if current_status == "cancelled":
+        if stage_dir:
+            shutil.rmtree(stage_dir, ignore_errors=True)
+        return
+
     if proc.returncode == 0:
         _apply_ia_thumbnail(Path(out_dir), job["url"])
         if use_smb and stage_dir:
@@ -264,19 +295,27 @@ def run_job(job_id: str) -> None:
 
 
 def worker() -> None:
+    global _active
     while True:
         job_id = work_queue.get()
+        # Wait until we're under the concurrency limit
+        with _active_cond:
+            while _active >= config.get("max_workers", 3):
+                _active_cond.wait()
+            _active += 1
         try:
             run_job(job_id)
         except Exception as exc:  # noqa: BLE001
             _set(job_id, status="error", error=str(exc))
         finally:
+            with _active_cond:
+                _active -= 1
+                _active_cond.notify_all()
             work_queue.task_done()
 
 
-MAX_WORKERS = 3
-
-for _ in range(MAX_WORKERS):
+_POOL_SIZE = 20  # large enough that the concurrency limit is always the bottleneck
+for _ in range(_POOL_SIZE):
     threading.Thread(target=worker, daemon=True).start()
 
 # --------------------------------------------------------------------------
@@ -293,6 +332,10 @@ class ConfigRequest(BaseModel):
     output_dir: str
 
 
+class WorkersRequest(BaseModel):
+    max_workers: int
+
+
 @app.get("/api/config")
 def get_config() -> dict:
     with _smb_lock:
@@ -300,6 +343,7 @@ def get_config() -> dict:
     smb = config.get("smb", {})
     return {
         "output_dir": config["output_dir"],
+        "max_workers": config.get("max_workers", 3),
         "yt_dlp_ok": shutil.which(YT_DLP) is not None,
         "ffmpeg_ok": shutil.which("ffmpeg") is not None,
         "smb_connected": connected,
@@ -326,6 +370,16 @@ def set_config(req: ConfigRequest) -> dict:
     config["output_dir"] = path
     save_config(config)
     return {"output_dir": path}
+
+
+@app.post("/api/workers")
+def set_workers(req: WorkersRequest) -> dict:
+    n = max(1, min(20, req.max_workers))
+    config["max_workers"] = n
+    save_config(config)
+    with _active_cond:
+        _active_cond.notify_all()
+    return {"max_workers": n}
 
 
 @app.post("/api/download")
@@ -358,9 +412,51 @@ def list_jobs() -> dict:
 @app.post("/api/jobs/clear")
 def clear_finished() -> dict:
     with jobs_lock:
-        for jid in [j["id"] for j in jobs.values() if j["status"] in ("done", "error")]:
+        for jid in [j["id"] for j in jobs.values() if j["status"] in ("done", "error", "cancelled")]:
             del jobs[jid]
     return {"ok": True}
+
+
+@app.post("/api/jobs/clear/done")
+def clear_done() -> dict:
+    with jobs_lock:
+        for jid in [j["id"] for j in jobs.values() if j["status"] == "done"]:
+            del jobs[jid]
+    return {"ok": True}
+
+
+@app.post("/api/jobs/{job_id}/cancel")
+def cancel_job(job_id: str) -> dict:
+    with jobs_lock:
+        job = jobs.get(job_id)
+    if not job:
+        raise HTTPException(404, "Job not found.")
+    if job["status"] in ("done", "error", "cancelled"):
+        raise HTTPException(400, "Job is already finished.")
+    _set(job_id, status="cancelled", finished=time.time())
+    with _job_procs_lock:
+        proc = _job_procs.get(job_id)
+    if proc:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+    return {"cancelled": True}
+
+
+@app.post("/api/jobs/{job_id}/retry")
+def retry_job(job_id: str) -> dict:
+    with jobs_lock:
+        job = jobs.get(job_id)
+    if not job:
+        raise HTTPException(404, "Job not found.")
+    if job["status"] not in ("error", "cancelled"):
+        raise HTTPException(400, "Only errored or cancelled jobs can be retried.")
+    _set(job_id,
+         status="queued", percent=0.0, percent_str="", speed="", eta="",
+         error="", current=None, total=None, queued_at=time.time())
+    work_queue.put(job_id)
+    return {"retried": True}
 
 
 class SmbConnectRequest(BaseModel):
