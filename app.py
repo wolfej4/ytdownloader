@@ -15,7 +15,6 @@ import subprocess
 import sys
 import threading
 import time
-import urllib.request
 import uuid
 from pathlib import Path
 
@@ -48,7 +47,7 @@ SENTINEL = "@@PROG@@"
 PROGRESS_TEMPLATE = (
     "download:" + SENTINEL
     + "%(progress._percent_str)s|%(progress._speed_str)s|"
-    + "%(progress._eta_str)s|%(info.title)s"
+    + "%(progress._eta_str)s|%(info.title)s|%(info.thumbnail)s"
 )
 
 
@@ -145,41 +144,12 @@ _active = 0
 _active_cond = threading.Condition()
 
 ITEM_RE = re.compile(r"Downloading item (\d+) of (\d+)")
-IA_ID_RE = re.compile(r"archive\.org/(?:details|download)/([^/?&#]+)")
 
 
 def _set(job_id: str, **fields) -> None:
     with jobs_lock:
         if job_id in jobs:
             jobs[job_id].update(fields)
-
-
-def _apply_ia_thumbnail(out_dir: Path, url: str) -> None:
-    """Fetch the Internet Archive item thumbnail and embed it into every mkv in out_dir."""
-    m = IA_ID_RE.search(url)
-    if not m:
-        return
-    thumb_url = f"https://archive.org/services/img/{m.group(1)}"
-    thumb_path = out_dir / ".ia_thumb.jpg"
-    try:
-        with urllib.request.urlopen(thumb_url) as resp:
-            thumb_path.write_bytes(resp.read())
-        for mkv in out_dir.glob("**/*.mkv"):
-            tmp = mkv.with_name(f".tmp_{mkv.name}")
-            r = subprocess.run(
-                ["ffmpeg", "-i", str(mkv), "-i", str(thumb_path),
-                 "-map", "0", "-map", "1", "-c", "copy",
-                 "-disposition:v:1", "attached_pic", str(tmp), "-y"],
-                capture_output=True,
-            )
-            if r.returncode == 0:
-                tmp.replace(mkv)
-            elif tmp.exists():
-                tmp.unlink()
-    except Exception:
-        pass
-    finally:
-        thumb_path.unlink(missing_ok=True)
 
 
 def run_job(job_id: str) -> None:
@@ -247,13 +217,17 @@ def run_job(job_id: str) -> None:
                 speed = (parts[1] if len(parts) > 1 else "").strip()
                 eta = (parts[2] if len(parts) > 2 else "").strip()
                 title = (parts[3] if len(parts) > 3 else "").strip()
+                thumb = (parts[4] if len(parts) > 4 else "").strip()
                 num = None
                 try:
                     num = float(pct.replace("%", ""))
                 except ValueError:
                     pass
-                _set(job_id, percent=num, percent_str=pct, speed=speed,
-                     eta=eta, title=title or job.get("title"))
+                updates: dict = dict(percent=num, percent_str=pct, speed=speed,
+                                     eta=eta, title=title or job.get("title"))
+                if thumb and thumb != "NA":
+                    updates["thumbnail_url"] = thumb
+                _set(job_id, **updates)
             else:
                 m = ITEM_RE.search(line)
                 if m:
@@ -273,7 +247,6 @@ def run_job(job_id: str) -> None:
         return
 
     if proc.returncode == 0:
-        _apply_ia_thumbnail(Path(out_dir), job["url"])
         if use_smb and stage_dir:
             _set(job_id, status="uploading", percent=100.0, percent_str="100%")
             try:
@@ -394,8 +367,8 @@ def submit(req: DownloadRequest) -> dict:
             jobs[job_id] = {
                 "id": job_id, "url": url, "status": "queued",
                 "percent": 0.0, "percent_str": "", "speed": "", "eta": "",
-                "title": "", "current": None, "total": None, "error": "",
-                "queued_at": time.time(),
+                "title": "", "thumbnail_url": "", "current": None, "total": None,
+                "error": "", "queued_at": time.time(),
             }
         work_queue.put(job_id)
         created.append(job_id)
@@ -454,7 +427,7 @@ def retry_job(job_id: str) -> dict:
         raise HTTPException(400, "Only errored or cancelled jobs can be retried.")
     _set(job_id,
          status="queued", percent=0.0, percent_str="", speed="", eta="",
-         error="", current=None, total=None, queued_at=time.time())
+         error="", current=None, total=None, thumbnail_url="", queued_at=time.time())
     work_queue.put(job_id)
     return {"retried": True}
 

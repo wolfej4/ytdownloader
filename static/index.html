@@ -103,7 +103,13 @@
   .job.queued     { border-left-color: var(--warn); }
   .job.cancelled  { border-left-color: var(--muted); }
 
-  .job-top { display: flex; justify-content: space-between; gap: 12px; align-items: baseline; }
+  .job-thumb {
+    width: 96px; height: 54px; object-fit: cover; border-radius: 5px;
+    flex-shrink: 0; background: var(--panel-2);
+  }
+  .job-thumb-empty { width: 96px; height: 54px; flex-shrink: 0; }
+
+  .job-top { display: flex; justify-content: space-between; gap: 12px; align-items: center; }
   .job-title { font-size: 14px; font-weight: 600; word-break: break-word; }
   .job-url { font-family: var(--mono); font-size: 11px; color: var(--muted); word-break: break-all; }
   .job-right { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
@@ -349,9 +355,14 @@ function row(j) {
     : "";
   const err = j.status === "error" && j.error ? `<div class="err">${escapeHtml(j.error)}</div>` : "";
 
+  const thumbHtml = (j.thumbnail_url && j.title)
+    ? `<img class="job-thumb" src="${escapeHtml(j.thumbnail_url)}" alt="" loading="lazy" onerror="this.style.display='none'">`
+    : `<div class="job-thumb-empty"></div>`;
+
   return `<div class="job ${j.status}">
     <div class="job-top">
-      <div>
+      ${thumbHtml}
+      <div style="min-width:0;flex:1">
         <div class="job-title">${escapeHtml(title)}${counter}</div>
         <div class="job-url">${escapeHtml(j.url)}</div>
       </div>
