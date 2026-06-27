@@ -182,6 +182,7 @@ def run_job(job_id: str) -> None:
         "--embed-thumbnail",
         "--convert-thumbnails", "jpg",
         "--embed-metadata",
+        "--remux-video", "mkv",
         "--merge-output-format", "mkv",
         "-o", "%(title).200B [%(id)s].%(ext)s",
         "-P", out_dir,
