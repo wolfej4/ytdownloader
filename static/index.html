@@ -350,16 +350,13 @@ function row(j) {
     ? `<button class="job-btn retry" data-action="retry" data-job-id="${j.id}">Retry</button>`
     : "";
 
-  const stats = j.status === "running"
-    ? `<div class="stats"><span><b>${j.percent_str || pct.toFixed(0)+"%"}</b></span>${j.speed ? `<span>${j.speed}</span>` : ""}${j.eta ? `<span>ETA ${j.eta}</span>` : ""}</div>`
-    : "";
   const err = j.status === "error" && j.error ? `<div class="err">${escapeHtml(j.error)}</div>` : "";
 
   const thumbHtml = (j.thumbnail_url && j.title)
     ? `<img class="job-thumb" src="${escapeHtml(j.thumbnail_url)}" alt="" loading="lazy" onerror="this.style.display='none'">`
     : `<div class="job-thumb-empty"></div>`;
 
-  return `<div class="job ${j.status}">
+  return `<div class="job ${j.status}" data-job-id="${j.id}">
     <div class="job-top">
       ${thumbHtml}
       <div style="min-width:0;flex:1">
@@ -372,7 +369,8 @@ function row(j) {
       </div>
     </div>
     <div class="bar"><span style="width:${Math.max(0, Math.min(100, pct))}%"></span></div>
-    ${stats}${err}
+    <div class="stats">${statsInner(j)}</div>
+    ${err}
   </div>`;
 }
 
@@ -380,13 +378,66 @@ function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c]));
 }
 
+function statsInner(j) {
+  if (j.status !== "running") return "";
+  const pct = j.percent != null ? j.percent : 0;
+  return `<span><b>${j.percent_str || pct.toFixed(0)+"%"}</b></span>`
+    + (j.speed ? `<span>${j.speed}</span>` : "")
+    + (j.eta   ? `<span>ETA ${j.eta}</span>` : "");
+}
+
+// Fields that require a full card rebuild when they change.
+// Live progress (percent/speed/eta) is updated surgically without touching the img.
+function structKey(j) {
+  return `${j.status}|${j.title}|${j.thumbnail_url}|${j.error}|${j.current}|${j.total}`;
+}
+
+let _structKeys = {};
+
 async function refresh() {
   try {
     const r = await fetch("/api/jobs");
     const { jobs } = await r.json();
     const el = $("jobs");
-    if (!jobs.length) { el.innerHTML = `<div class="empty">No transfers yet.</div>`; return; }
-    el.innerHTML = jobs.map(row).join("");
+
+    if (!jobs.length) {
+      el.innerHTML = `<div class="empty">No transfers yet.</div>`;
+      _structKeys = {};
+      return;
+    }
+
+    const jobIds = jobs.map(j => j.id);
+    const domIds = [...el.querySelectorAll(".job[data-job-id]")].map(e => e.dataset.jobId);
+
+    if (JSON.stringify(jobIds) !== JSON.stringify(domIds)) {
+      // List order or membership changed — full rebuild
+      el.innerHTML = jobs.map(row).join("");
+      _structKeys = {};
+      jobs.forEach(j => { _structKeys[j.id] = structKey(j); });
+      return;
+    }
+
+    for (const j of jobs) {
+      const card = el.querySelector(`.job[data-job-id="${j.id}"]`);
+      if (!card) continue;
+
+      const sk = structKey(j);
+      if (_structKeys[j.id] !== sk) {
+        // Structure changed (title resolved, thumbnail appeared, status flipped, etc.)
+        // Replace the whole card — this is rare after the first progress event.
+        const tmp = document.createElement("div");
+        tmp.innerHTML = row(j);
+        card.replaceWith(tmp.firstElementChild);
+        _structKeys[j.id] = sk;
+      } else {
+        // Only live progress changed — update bar and stats without touching the img
+        const pct = j.percent != null ? j.percent : 0;
+        const barSpan = card.querySelector(".bar > span");
+        if (barSpan) barSpan.style.width = `${Math.max(0, Math.min(100, pct))}%`;
+        const statsEl = card.querySelector(".stats");
+        if (statsEl) statsEl.innerHTML = statsInner(j);
+      }
+    }
   } catch (e) { /* keep last render on transient errors */ }
 }
 
