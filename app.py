@@ -18,6 +18,7 @@ import time
 import uuid
 from pathlib import Path
 
+import requests
 import smbclient
 
 from fastapi import FastAPI, HTTPException
@@ -296,6 +297,167 @@ for _ in range(_POOL_SIZE):
 # API
 # --------------------------------------------------------------------------
 app = FastAPI(title="RT Grabber")
+
+# --------------------------------------------------------------------------
+# RT Archive browsing (reads the same public Firestore backend the
+# rtarchive.org web app itself queries client-side)
+# --------------------------------------------------------------------------
+FIRESTORE_URL = "https://firestore.googleapis.com/v1/projects/rt-archive/databases/(default)/documents"
+
+_shows_cache: dict = {"data": None, "ts": 0.0}
+_shows_lock = threading.Lock()
+SHOWS_TTL = 3600.0
+
+
+def _fs_val(v: dict):
+    if "stringValue" in v:
+        return v["stringValue"]
+    if "integerValue" in v:
+        return int(v["integerValue"])
+    if "doubleValue" in v:
+        return v["doubleValue"]
+    if "booleanValue" in v:
+        return v["booleanValue"]
+    if "nullValue" in v:
+        return None
+    if "arrayValue" in v:
+        return [_fs_val(x) for x in v["arrayValue"].get("values", [])]
+    if "mapValue" in v:
+        return {k: _fs_val(x) for k, x in v["mapValue"].get("fields", {}).items()}
+    if "referenceValue" in v:
+        return v["referenceValue"]
+    return None
+
+
+def _fs_doc(doc: dict) -> dict:
+    out = {k: _fs_val(v) for k, v in doc.get("fields", {}).items()}
+    out["id"] = doc["name"].rsplit("/", 1)[-1]
+    return out
+
+
+def _fetch_all_shows() -> list[dict]:
+    shows: list[dict] = []
+    page_token = None
+    while True:
+        params = {"pageSize": 300}
+        if page_token:
+            params["pageToken"] = page_token
+        resp = requests.get(f"{FIRESTORE_URL}/shows", params=params, timeout=20)
+        resp.raise_for_status()
+        data = resp.json()
+        for doc in data.get("documents", []):
+            shows.append(_fs_doc(doc))
+        page_token = data.get("nextPageToken")
+        if not page_token:
+            break
+    return shows
+
+
+def get_shows() -> list[dict]:
+    with _shows_lock:
+        stale = time.time() - _shows_cache["ts"] > SHOWS_TTL
+        if _shows_cache["data"] is None or stale:
+            try:
+                _shows_cache["data"] = _fetch_all_shows()
+                _shows_cache["ts"] = time.time()
+            except Exception:
+                if _shows_cache["data"] is None:
+                    raise
+        return _shows_cache["data"]
+
+
+def _show_thumbnail(show: dict) -> str:
+    try:
+        images = show["rt_metadata"]["included"]["images"]
+    except (KeyError, TypeError):
+        return ""
+    if not images:
+        return ""
+    for want in ("title_card", "poster", "hero"):
+        for im in images:
+            if im.get("attributes", {}).get("image_type") == want:
+                return im["attributes"].get("thumb", "")
+    return images[0].get("attributes", {}).get("thumb", "")
+
+
+def _run_firestore_query(body: dict) -> list[dict]:
+    resp = requests.post(f"{FIRESTORE_URL}:runQuery", json=body, timeout=20)
+    resp.raise_for_status()
+    return [_fs_doc(row["document"]) for row in resp.json() if "document" in row]
+
+
+def _archive_ia_url(platform: str, external_id: str) -> str:
+    return f"https://archive.org/details/{platform}-{external_id}"
+
+
+@app.get("/api/browse/shows")
+def browse_shows(q: str = "") -> dict:
+    try:
+        shows = get_shows()
+    except Exception as exc:
+        raise HTTPException(502, f"Couldn't reach RT Archive: {exc}")
+
+    needle = q.strip().lower()
+    results = []
+    for s in shows:
+        title = s.get("title") or s["id"]
+        if needle and needle not in title.lower():
+            continue
+        results.append({
+            "id": s["id"],
+            "title": title,
+            "episode_count": s.get("rt_episode_count", 0),
+            "thumbnail": _show_thumbnail(s),
+        })
+    results.sort(key=lambda r: r["title"].lower())
+    return {"shows": results[:200]}
+
+
+@app.get("/api/browse/shows/{show_id}/episodes")
+def browse_episodes(show_id: str) -> dict:
+    body = {
+        "structuredQuery": {
+            "from": [{"collectionId": "videos"}],
+            "where": {"fieldFilter": {
+                "field": {"fieldPath": "shows"},
+                "op": "ARRAY_CONTAINS",
+                "value": {"stringValue": show_id},
+            }},
+            "limit": 1000,
+        }
+    }
+    try:
+        docs = _run_firestore_query(body)
+    except Exception as exc:
+        raise HTTPException(502, f"Couldn't reach RT Archive: {exc}")
+
+    episodes = []
+    for d in docs:
+        platform = d.get("platform")
+        ai_id = d.get("ai_id") or ""
+        own_url = f"https://archive.org/details/{ai_id}" if ai_id else None
+        rt_url = own_url if platform == "roosterteeth" else None
+        youtube_url = own_url if platform == "youtube" else None
+
+        linked_id = d.get("linked_video_id")
+        linked_platform = d.get("linked_video_platform")
+        if linked_id and linked_platform:
+            linked_url = _archive_ia_url(linked_platform, linked_id)
+            if linked_platform == "roosterteeth" and not rt_url:
+                rt_url = linked_url
+            elif linked_platform == "youtube" and not youtube_url:
+                youtube_url = linked_url
+
+        episodes.append({
+            "id": d["id"],
+            "title": d.get("title") or d["id"],
+            "date": d.get("sort_date") or d.get("date") or 0,
+            "duration": d.get("duration"),
+            "rt_url": rt_url,
+            "youtube_url": youtube_url,
+        })
+    episodes.sort(key=lambda e: e["date"])
+    return {"episodes": episodes}
 
 
 class DownloadRequest(BaseModel):

@@ -156,6 +156,33 @@
   .toast.show { opacity: 1; }
 
   @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+
+  .pref-btn.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+
+  .browse-list {
+    max-height: 320px; overflow-y: auto; margin-top: 10px;
+    border: 1px solid var(--line); border-radius: 8px;
+  }
+  .browse-item {
+    display: flex; align-items: center; gap: 10px; padding: 9px 12px;
+    border-bottom: 1px solid var(--line); cursor: pointer; font-size: 13.5px;
+  }
+  .browse-item:last-child { border-bottom: none; }
+  .browse-item:hover { background: var(--panel-2); }
+  .browse-item img {
+    width: 56px; height: 32px; object-fit: cover; border-radius: 4px;
+    background: var(--panel-2); flex-shrink: 0;
+  }
+  .browse-meta { color: var(--muted); font-size: 11px; font-family: var(--mono); }
+
+  .ep-row {
+    display: flex; align-items: center; gap: 10px; padding: 8px 12px;
+    border-bottom: 1px solid var(--line); font-size: 13px;
+  }
+  .ep-row:last-child { border-bottom: none; }
+  .ep-badges { display: flex; gap: 4px; margin-left: auto; font-family: var(--mono); font-size: 10px; flex-shrink: 0; }
+  .ep-badge { padding: 2px 6px; border-radius: 10px; border: 1px solid var(--line); color: var(--muted); }
+  .ep-badge.avail { color: var(--ok); border-color: #38492c; }
 </style>
 </head>
 <body>
@@ -209,6 +236,32 @@
         <button id="saveWorkers" style="padding:8px 14px;font-size:13px">Save</button>
       </div>
       <button class="primary" id="start">Start downloads</button>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="row spread" style="margin-bottom:14px">
+      <span class="label" style="margin:0">Browse RT Archive</span>
+      <div class="row" style="gap:6px">
+        <span class="label" style="margin:0">Prefer</span>
+        <button class="job-btn pref-btn" id="prefRt" data-pref="roosterteeth">Website</button>
+        <button class="job-btn pref-btn" id="prefYt" data-pref="youtube">YouTube</button>
+      </div>
+    </div>
+    <input type="text" id="showSearch" spellcheck="false" placeholder="Search shows…" />
+    <div id="showResults" class="browse-list" style="display:none"></div>
+
+    <div id="episodePanel" style="display:none;margin-top:14px">
+      <div class="row spread" style="margin-bottom:8px">
+        <span class="job-title" id="episodeShowTitle"></span>
+        <label style="font-size:12px;color:var(--muted);display:flex;gap:6px;align-items:center;cursor:pointer">
+          <input type="checkbox" id="selectAllEpisodes"> Select all
+        </label>
+      </div>
+      <div id="episodeList" class="browse-list"></div>
+      <div class="row" style="margin-top:12px;justify-content:flex-end">
+        <button class="primary" id="queueSelected">Queue selected</button>
+      </div>
     </div>
   </div>
 
@@ -440,6 +493,99 @@ async function refresh() {
     }
   } catch (e) { /* keep last render on transient errors */ }
 }
+
+// --- RT Archive browse ---
+let currentPref = "roosterteeth";
+let currentEpisodes = [];
+
+function setPref(p) {
+  currentPref = p;
+  $("prefRt").classList.toggle("active", p === "roosterteeth");
+  $("prefYt").classList.toggle("active", p === "youtube");
+}
+$("prefRt").onclick = () => setPref("roosterteeth");
+$("prefYt").onclick = () => setPref("youtube");
+setPref("roosterteeth");
+
+let _searchTimer;
+$("showSearch").addEventListener("input", () => {
+  clearTimeout(_searchTimer);
+  _searchTimer = setTimeout(searchShows, 300);
+});
+
+async function searchShows() {
+  const q = $("showSearch").value.trim();
+  const el = $("showResults");
+  el.style.display = "";
+  el.innerHTML = `<div class="empty" style="padding:14px;border:none">Searching…</div>`;
+  try {
+    const r = await fetch(`/api/browse/shows?q=${encodeURIComponent(q)}`);
+    const { shows } = await r.json();
+    if (!shows.length) { el.innerHTML = `<div class="empty" style="padding:14px;border:none">No shows found.</div>`; return; }
+    el.innerHTML = shows.map(s => `
+      <div class="browse-item" data-show-id="${escapeHtml(s.id)}" data-show-title="${escapeHtml(s.title)}">
+        ${s.thumbnail ? `<img src="${escapeHtml(s.thumbnail)}" loading="lazy" onerror="this.remove()">` : ""}
+        <div style="min-width:0;flex:1">
+          <div>${escapeHtml(s.title)}</div>
+          <div class="browse-meta">${s.episode_count || 0} episodes</div>
+        </div>
+      </div>`).join("");
+  } catch { el.innerHTML = `<div class="empty" style="padding:14px;border:none">Search failed.</div>`; }
+}
+
+$("showResults").addEventListener("click", (e) => {
+  const item = e.target.closest("[data-show-id]");
+  if (!item) return;
+  loadEpisodes(item.dataset.showId, item.dataset.showTitle);
+});
+
+async function loadEpisodes(showId, showTitle) {
+  $("episodePanel").style.display = "";
+  $("episodeShowTitle").textContent = showTitle;
+  $("selectAllEpisodes").checked = false;
+  const el = $("episodeList");
+  el.innerHTML = `<div class="empty" style="padding:14px;border:none">Loading…</div>`;
+  try {
+    const r = await fetch(`/api/browse/shows/${encodeURIComponent(showId)}/episodes`);
+    const { episodes } = await r.json();
+    currentEpisodes = episodes;
+    if (!episodes.length) { el.innerHTML = `<div class="empty" style="padding:14px;border:none">No archived episodes found.</div>`; return; }
+    el.innerHTML = episodes.map((ep, i) => `
+      <div class="ep-row">
+        <input type="checkbox" class="ep-check" data-idx="${i}">
+        <span style="min-width:0;flex:1">${escapeHtml(ep.title)}</span>
+        <span class="ep-badges">
+          <span class="ep-badge ${ep.rt_url ? "avail" : ""}">RT</span>
+          <span class="ep-badge ${ep.youtube_url ? "avail" : ""}">YT</span>
+        </span>
+      </div>`).join("");
+  } catch { el.innerHTML = `<div class="empty" style="padding:14px;border:none">Failed to load episodes.</div>`; }
+}
+
+$("selectAllEpisodes").onchange = (e) => {
+  $("episodeList").querySelectorAll(".ep-check").forEach(cb => cb.checked = e.target.checked);
+};
+
+$("queueSelected").onclick = async () => {
+  const checks = [...$("episodeList").querySelectorAll(".ep-check:checked")];
+  if (!checks.length) { toast("Select at least one episode."); return; }
+  const urls = [];
+  for (const cb of checks) {
+    const ep = currentEpisodes[+cb.dataset.idx];
+    const url = (currentPref === "youtube" ? ep.youtube_url : ep.rt_url) || ep.youtube_url || ep.rt_url;
+    if (url) urls.push(url);
+  }
+  if (!urls.length) { toast("None of the selected episodes are archived."); return; }
+  const btn = $("queueSelected"); btn.disabled = true;
+  try {
+    const r = await fetch("/api/download", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({ urls }),
+    });
+    if (r.ok) { toast(`Queued ${urls.length} item${urls.length > 1 ? "s" : ""}.`); refresh(); }
+    else { const e = await r.json(); toast(e.detail || "Couldn't queue downloads."); }
+  } finally { btn.disabled = false; }
+};
 
 loadConfig();
 refresh();

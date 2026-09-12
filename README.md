@@ -21,9 +21,16 @@ http://127.0.0.1:8765 in your browser. Close the server window to stop it.
 ## Use
 
 1. Set your download folder (e.g. C:\Users\you\Videos\RoosterTeeth), click Save.
-2. Paste one URL per line, click Start downloads.
+2. Paste one URL per line, click Start downloads — or use **Browse RT Archive**
+   below it to search for a show, tick the episodes you want, pick whether you
+   prefer the Website or YouTube source with the toggle, and click
+   "Queue selected". No need to copy IA links by hand.
 3. Watch progress; files land in per-video folders ready for a Jellyfin
    "Home Videos and Photos" library.
+
+The Browse panel reads rtarchive.org's own public show/episode catalog
+directly (the same data its web UI loads), so it works even though the
+site itself doesn't offer a bulk-select download option.
 
 The app downloads one item at a time and remembers what it has already grabbed
 (.downloaded.txt in the output folder), so you can re-run with more URLs anytime.
