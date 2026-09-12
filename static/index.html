@@ -550,15 +550,20 @@ async function loadEpisodes(showId, showTitle) {
     const { episodes } = await r.json();
     currentEpisodes = episodes;
     if (!episodes.length) { el.innerHTML = `<div class="empty" style="padding:14px;border:none">No archived episodes found.</div>`; return; }
-    el.innerHTML = episodes.map((ep, i) => `
+    el.innerHTML = episodes.map((ep, i) => {
+      const se = (ep.season != null && ep.episode_number != null)
+        ? `S${String(ep.season).padStart(2,"0")}E${String(ep.episode_number).padStart(2,"0")} — `
+        : "";
+      return `
       <div class="ep-row">
         <input type="checkbox" class="ep-check" data-idx="${i}">
-        <span style="min-width:0;flex:1">${escapeHtml(ep.title)}</span>
+        <span style="min-width:0;flex:1"><span class="browse-meta">${se}</span>${escapeHtml(ep.title)}</span>
         <span class="ep-badges">
           <span class="ep-badge ${ep.rt_url ? "avail" : ""}">RT</span>
           <span class="ep-badge ${ep.youtube_url ? "avail" : ""}">YT</span>
         </span>
-      </div>`).join("");
+      </div>`;
+    }).join("");
   } catch { el.innerHTML = `<div class="empty" style="padding:14px;border:none">Failed to load episodes.</div>`; }
 }
 
@@ -569,20 +574,20 @@ $("selectAllEpisodes").onchange = (e) => {
 $("queueSelected").onclick = async () => {
   const checks = [...$("episodeList").querySelectorAll(".ep-check:checked")];
   if (!checks.length) { toast("Select at least one episode."); return; }
-  const urls = [];
+  const items = [];
   for (const cb of checks) {
     const ep = currentEpisodes[+cb.dataset.idx];
     const url = (currentPref === "youtube" ? ep.youtube_url : ep.rt_url) || ep.youtube_url || ep.rt_url;
-    if (url) urls.push(url);
+    if (url) items.push({ url, show: ep.show, season: ep.season, episode: ep.episode_number });
   }
-  if (!urls.length) { toast("None of the selected episodes are archived."); return; }
+  if (!items.length) { toast("None of the selected episodes are archived."); return; }
   const btn = $("queueSelected"); btn.disabled = true;
   try {
     const r = await fetch("/api/download", {
       method: "POST", headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({ urls }),
+      body: JSON.stringify({ items }),
     });
-    if (r.ok) { toast(`Queued ${urls.length} item${urls.length > 1 ? "s" : ""}.`); refresh(); }
+    if (r.ok) { toast(`Queued ${items.length} item${items.length > 1 ? "s" : ""}.`); refresh(); }
     else { const e = await r.json(); toast(e.detail || "Couldn't queue downloads."); }
   } finally { btn.disabled = false; }
 };

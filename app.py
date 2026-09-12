@@ -146,6 +146,25 @@ _active_cond = threading.Condition()
 
 ITEM_RE = re.compile(r"Downloading item (\d+) of (\d+)")
 
+_INVALID_PATH_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+
+def _sanitize_pathpart(name: str) -> str:
+    cleaned = _INVALID_PATH_CHARS.sub("", name).strip().rstrip(". ")
+    return cleaned[:150] or "Untitled"
+
+
+def _build_output_template(job: dict) -> str:
+    prefix = ""
+    season, episode = job.get("season"), job.get("episode")
+    if season is not None and episode is not None:
+        prefix = f"S{int(season):02d}E{int(episode):02d} - "
+    filename = f"{prefix}%(title).200B [%(id)s].%(ext)s"
+    show = job.get("show")
+    if show:
+        return f"{_sanitize_pathpart(show)}/{filename}"
+    return filename
+
 
 def _set(job_id: str, **fields) -> None:
     with jobs_lock:
@@ -185,7 +204,7 @@ def run_job(job_id: str) -> None:
         "--embed-metadata",
         "--remux-video", "mkv",
         "--merge-output-format", "mkv",
-        "-o", "%(title).200B [%(id)s].%(ext)s",
+        "-o", _build_output_template(job),
         "-P", out_dir,
         job["url"],
     ]
@@ -415,6 +434,14 @@ def browse_shows(q: str = "") -> dict:
 
 @app.get("/api/browse/shows/{show_id}/episodes")
 def browse_episodes(show_id: str) -> dict:
+    fallback_title = show_id
+    try:
+        fallback_title = next(
+            (s.get("title") for s in get_shows() if s["id"] == show_id), show_id
+        )
+    except Exception:
+        pass
+
     body = {
         "structuredQuery": {
             "from": [{"collectionId": "videos"}],
@@ -448,6 +475,8 @@ def browse_episodes(show_id: str) -> dict:
             elif linked_platform == "youtube" and not youtube_url:
                 youtube_url = linked_url
 
+        attrs = (d.get("rt_metadata") or {}).get("attributes") or {}
+
         episodes.append({
             "id": d["id"],
             "title": d.get("title") or d["id"],
@@ -455,13 +484,24 @@ def browse_episodes(show_id: str) -> dict:
             "duration": d.get("duration"),
             "rt_url": rt_url,
             "youtube_url": youtube_url,
+            "show": attrs.get("show_title") or fallback_title,
+            "season": attrs.get("season_number"),
+            "episode_number": attrs.get("number"),
         })
     episodes.sort(key=lambda e: e["date"])
     return {"episodes": episodes}
 
 
+class DownloadItem(BaseModel):
+    url: str
+    show: str | None = None
+    season: int | None = None
+    episode: int | None = None
+
+
 class DownloadRequest(BaseModel):
-    urls: list[str]
+    urls: list[str] = []
+    items: list[DownloadItem] = []
 
 
 class ConfigRequest(BaseModel):
@@ -520,15 +560,17 @@ def set_workers(req: WorkersRequest) -> dict:
 
 @app.post("/api/download")
 def submit(req: DownloadRequest) -> dict:
-    urls = [u.strip() for u in req.urls if u.strip()]
-    if not urls:
+    items = list(req.items) + [DownloadItem(url=u) for u in req.urls if u.strip()]
+    items = [it for it in items if it.url.strip()]
+    if not items:
         raise HTTPException(400, "No URLs provided.")
     created = []
-    for url in urls:
+    for item in items:
         job_id = uuid.uuid4().hex[:8]
         with jobs_lock:
             jobs[job_id] = {
-                "id": job_id, "url": url, "status": "queued",
+                "id": job_id, "url": item.url.strip(), "status": "queued",
+                "show": item.show, "season": item.season, "episode": item.episode,
                 "percent": 0.0, "percent_str": "", "speed": "", "eta": "",
                 "title": "", "thumbnail_url": "", "current": None, "total": None,
                 "error": "", "queued_at": time.time(),
