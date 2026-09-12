@@ -265,6 +265,20 @@
     </div>
   </div>
 
+  <div class="panel">
+    <div class="row spread" style="margin-bottom:10px">
+      <span class="label" style="margin:0">Thumbnails</span>
+    </div>
+    <p class="sub" style="margin:0 0 14px">
+      Scans your download folder for videos missing a sidecar thumbnail, or a
+      show folder missing cover art, and fetches them automatically.
+    </p>
+    <div class="row spread">
+      <button class="primary pref-btn" id="scanThumbs">Scan for missing thumbnails</button>
+      <span class="browse-meta" id="scanStatus"></span>
+    </div>
+  </div>
+
   <h2 class="section">
     Transfers
     <span class="section-btns">
@@ -591,6 +605,39 @@ $("queueSelected").onclick = async () => {
     else { const e = await r.json(); toast(e.detail || "Couldn't queue downloads."); }
   } finally { btn.disabled = false; }
 };
+
+// --- Thumbnail backfill scan ---
+async function pollScanStatus() {
+  try {
+    const r = await fetch("/api/thumbnails/scan");
+    const s = await r.json();
+    const btn = $("scanThumbs");
+    const status = $("scanStatus");
+    if (s.running) {
+      btn.disabled = true;
+      btn.textContent = "Scanning…";
+      status.textContent = `${s.checked}/${s.total} checked · ${s.added} added${s.errors ? ` · ${s.errors} failed` : ""}`;
+    } else {
+      btn.disabled = false;
+      btn.textContent = "Scan for missing thumbnails";
+      status.textContent = s.finished_at
+        ? `Last scan: ${s.checked} checked, ${s.added} added${s.errors ? `, ${s.errors} failed` : ""}.`
+        : "";
+    }
+  } catch { /* keep last state on transient errors */ }
+}
+
+$("scanThumbs").onclick = async () => {
+  try {
+    const r = await fetch("/api/thumbnails/scan", { method: "POST" });
+    if (!r.ok) { const d = await r.json(); toast(d.detail || "Couldn't start scan."); return; }
+    toast("Scanning for missing thumbnails…");
+    pollScanStatus();
+  } catch { toast("Couldn't start scan."); }
+};
+
+pollScanStatus();
+setInterval(pollScanStatus, 1500);
 
 loadConfig();
 refresh();
