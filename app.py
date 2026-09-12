@@ -7,6 +7,7 @@ Run:  python app.py    then open  http://127.0.0.1:8765
 """
 
 import json
+import logging
 import os
 import queue
 import re
@@ -46,6 +47,15 @@ DEFAULT_OUTPUT = os.environ.get("OUTPUT_DIR") or str(
 YT_DLP = os.environ.get("YT_DLP_BIN", "yt-dlp")
 FFMPEG_BIN = os.environ.get("FFMPEG_BIN", "ffmpeg")
 SENTINEL = "@@PROG@@"
+
+# Plain stdout logging so `docker logs` / Portainer's log viewer show it.
+logging.basicConfig(
+    level=os.environ.get("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+    stream=sys.stdout,
+)
+log = logging.getLogger("rt-grabber")
+thumb_log = logging.getLogger("rt-grabber.thumbnails")
 
 PROGRESS_TEMPLATE = (
     "download:" + SENTINEL
@@ -577,21 +587,34 @@ def _webp_to_jpg(data: bytes) -> bytes | None:
         src, dst = Path(td) / "in.webp", Path(td) / "out.jpg"
         src.write_bytes(data)
         try:
-            subprocess.run(
+            result = subprocess.run(
                 [FFMPEG_BIN, "-y", "-loglevel", "error", "-i", str(src), str(dst)],
-                check=True, timeout=30,
+                capture_output=True, text=True, timeout=30,
             )
-        except Exception:
+        except FileNotFoundError:
+            thumb_log.error("ffmpeg binary %r not found on PATH — can't convert webp to jpg", FFMPEG_BIN)
             return None
-        return dst.read_bytes() if dst.exists() else None
+        except Exception as exc:
+            thumb_log.error("ffmpeg conversion crashed: %s", exc)
+            return None
+        if result.returncode != 0:
+            thumb_log.warning("ffmpeg exited %s converting webp->jpg: %s",
+                               result.returncode, result.stderr.strip()[-500:])
+            return None
+        if not dst.exists():
+            thumb_log.warning("ffmpeg reported success but produced no output file")
+            return None
+        return dst.read_bytes()
 
 
 def _fetch_ia_thumbnail_jpg(identifier: str) -> bytes | None:
+    meta_url = f"https://archive.org/metadata/{identifier}"
     try:
-        resp = requests.get(f"https://archive.org/metadata/{identifier}", timeout=20)
+        resp = requests.get(meta_url, timeout=20)
         resp.raise_for_status()
         files = resp.json().get("files", [])
-    except Exception:
+    except Exception as exc:
+        thumb_log.warning("metadata fetch failed for %s (%s): %s", identifier, meta_url, exc)
         return None
 
     webp_name = None
@@ -603,33 +626,47 @@ def _fetch_ia_thumbnail_jpg(identifier: str) -> bytes | None:
     if not webp_name:
         webp_name = next((f["name"] for f in files if f.get("name", "").lower().endswith(".webp")), None)
     if not webp_name:
+        sample = [f.get("name") for f in files[:15]]
+        thumb_log.warning("no .webp file found in %s's IA metadata (%d files); sample: %s",
+                           identifier, len(files), sample)
+        return None
+    thumb_log.info("using %s as thumbnail source for %s", webp_name, identifier)
+
+    dl_url = f"https://archive.org/download/{identifier}/{webp_name}"
+    try:
+        img = requests.get(dl_url, timeout=30)
+        img.raise_for_status()
+    except Exception as exc:
+        thumb_log.warning("thumbnail download failed for %s (%s): %s", identifier, dl_url, exc)
         return None
 
-    try:
-        img = requests.get(f"https://archive.org/download/{identifier}/{webp_name}", timeout=30)
-        img.raise_for_status()
-    except Exception:
-        return None
-    return _webp_to_jpg(img.content)
+    jpg = _webp_to_jpg(img.content)
+    if jpg is None:
+        thumb_log.warning("webp->jpg conversion failed for %s", identifier)
+    return jpg
 
 
 def _lookup_show_poster(folder_name: str) -> bytes | None:
     try:
         shows = get_shows()
-    except Exception:
+    except Exception as exc:
+        thumb_log.warning("couldn't load show catalog to find art for folder %r: %s", folder_name, exc)
         return None
     needle = folder_name.strip().lower()
     match = next((s for s in shows if (s.get("title") or "").strip().lower() == needle), None)
     if not match:
+        thumb_log.warning("no rtarchive.org show matches folder name %r — skipping folder.jpg", folder_name)
         return None
     url = _show_thumbnail(match, size="large") or _show_thumbnail(match)
     if not url:
+        thumb_log.warning("show %r matched but has no artwork in its catalog entry", folder_name)
         return None
     try:
         r = requests.get(url, timeout=30)
         r.raise_for_status()
         return r.content
-    except Exception:
+    except Exception as exc:
+        thumb_log.warning("show art download failed for %r (%s): %s", folder_name, url, exc)
         return None
 
 
@@ -677,13 +714,21 @@ def _show_folder_name(kind: str, dirpath: str, root: str) -> str | None:
 
 
 def _run_thumbnail_scan() -> None:
-    videos = list(_iter_video_files())
+    with _smb_lock:
+        use_smb = _smb_connected
+    thumb_log.info("scan starting — source=%s output_dir=%s",
+                    "smb" if use_smb else "local", config.get("output_dir"))
     with _thumb_scan_lock:
-        _thumb_scan_state.update(running=True, checked=0, total=len(videos),
+        _thumb_scan_state.update(running=True, checked=0, total=0,
                                   added=0, errors=0, finished_at=None)
 
     seen_folders: set = set()
     try:
+        videos = list(_iter_video_files())
+        thumb_log.info("found %d video file(s) to check", len(videos))
+        with _thumb_scan_lock:
+            _thumb_scan_state["total"] = len(videos)
+
         for kind, dirpath, filename, root in videos:
             with _thumb_scan_lock:
                 _thumb_scan_state["checked"] += 1
@@ -691,16 +736,29 @@ def _run_thumbnail_scan() -> None:
             base = filename.rsplit(".", 1)[0]
             jpg_name = f"{base}.jpg"
             vid_id = _bracket_id(filename)
-            if vid_id and _IA_ID_RE.match(vid_id) and not _fpath_exists(kind, dirpath, jpg_name):
+
+            if not vid_id:
+                thumb_log.debug("skip %r — no [id] found in filename", filename)
+            elif not _IA_ID_RE.match(vid_id):
+                thumb_log.debug("skip %r — id %r doesn't look like an archive.org RT/YouTube id", filename, vid_id)
+            elif _fpath_exists(kind, dirpath, jpg_name):
+                thumb_log.debug("skip %r — %s already exists", filename, jpg_name)
+            else:
+                thumb_log.info("fetching thumbnail for %r (id=%s)", filename, vid_id)
                 data = _fetch_ia_thumbnail_jpg(vid_id)
-                with _thumb_scan_lock:
-                    if data:
-                        try:
-                            _fwrite_bytes(kind, dirpath, jpg_name, data)
+                if data:
+                    try:
+                        _fwrite_bytes(kind, dirpath, jpg_name, data)
+                        thumb_log.info("wrote %s/%s (%d bytes)", dirpath, jpg_name, len(data))
+                        with _thumb_scan_lock:
                             _thumb_scan_state["added"] += 1
-                        except Exception:
+                    except Exception as exc:
+                        thumb_log.error("failed writing %s/%s: %s", dirpath, jpg_name, exc)
+                        with _thumb_scan_lock:
                             _thumb_scan_state["errors"] += 1
-                    else:
+                else:
+                    thumb_log.warning("no thumbnail obtained for %r (id=%s) — see warnings above", filename, vid_id)
+                    with _thumb_scan_lock:
                         _thumb_scan_state["errors"] += 1
 
             folder_key = (kind, dirpath)
@@ -708,19 +766,29 @@ def _run_thumbnail_scan() -> None:
                 seen_folders.add(folder_key)
                 show_name = _show_folder_name(kind, dirpath, root)
                 if show_name and not _fpath_exists(kind, dirpath, "folder.jpg"):
+                    thumb_log.info("fetching show art for folder %r", show_name)
                     poster = _lookup_show_poster(show_name)
                     if poster:
                         try:
                             _fwrite_bytes(kind, dirpath, "folder.jpg", poster)
+                            thumb_log.info("wrote %s/folder.jpg (%d bytes)", dirpath, len(poster))
                             with _thumb_scan_lock:
                                 _thumb_scan_state["added"] += 1
-                        except Exception:
+                        except Exception as exc:
+                            thumb_log.error("failed writing %s/folder.jpg: %s", dirpath, exc)
                             with _thumb_scan_lock:
                                 _thumb_scan_state["errors"] += 1
+                    else:
+                        with _thumb_scan_lock:
+                            _thumb_scan_state["errors"] += 1
+    except Exception:
+        thumb_log.exception("thumbnail scan crashed")
     finally:
         with _thumb_scan_lock:
             _thumb_scan_state["running"] = False
             _thumb_scan_state["finished_at"] = time.time()
+        thumb_log.info("scan finished — checked=%d added=%d errors=%d",
+                        _thumb_scan_state["checked"], _thumb_scan_state["added"], _thumb_scan_state["errors"])
 
 
 @app.post("/api/thumbnails/scan")
