@@ -3,3 +3,4 @@ uvicorn[standard]
 aiofiles
 yt-dlp
 smbprotocol
+requests
