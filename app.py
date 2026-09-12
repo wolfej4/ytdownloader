@@ -583,9 +583,26 @@ def _bracket_id(filename: str) -> str | None:
 
 
 _IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".webp", ".gif")
+_VIDEO_FILE_EXTS = (".mp4", ".m4v", ".mov", ".webm", ".mkv", ".avi", ".mpg", ".mpeg")
 
 
 def _select_ia_thumbnail_file(files: list[dict]) -> dict | None:
+    # 1. archive.org's derive process names a video's poster frame after the
+    #    uploaded source file itself, just swapped to .jpg — e.g. the
+    #    original "2013-12-16_GTA_V_Train_Hopping_[17627].mp4" gets a
+    #    matching "...[17627].jpg" alongside it. This is the real convention
+    #    and the most reliable match when the original file is identifiable.
+    by_name_lower = {f.get("name", "").lower(): f for f in files}
+    originals = [
+        f for f in files
+        if f.get("source") == "original" and f.get("name", "").lower().endswith(_VIDEO_FILE_EXTS)
+    ]
+    for orig in originals:
+        stem = orig["name"].rsplit(".", 1)[0]
+        match = by_name_lower.get(f"{stem.lower()}.jpg") or by_name_lower.get(f"{stem.lower()}.jpeg")
+        if match:
+            return match
+
     # Exclude the ".thumbs/" directory archive.org auto-generates for every
     # video: dozens of tiny per-frame scrubber captures that happen to have
     # "thumb" in their path but are never the actual poster image.
@@ -596,16 +613,15 @@ def _select_ia_thumbnail_file(files: list[dict]) -> dict | None:
     ]
     if not candidates:
         return None
-    # 1. archive.org's own canonical "item image" — the most reliable signal
-    #    when present, and always a jpg.
+    # 2. archive.org's own canonical "item image" — reliable when present.
     exact = next((f for f in candidates if f.get("name", "").lower() == "__ia_thumb.jpg"), None)
     if exact:
         return exact
-    # 2. Anything IA itself tagged as the item's tile image.
+    # 3. Anything IA itself tagged as the item's tile image.
     tagged = [f for f in candidates if "item tile" in (f.get("format") or "").lower()]
     if tagged:
         return max(tagged, key=lambda f: int(f.get("size") or 0))
-    # 3. Last resort: the largest remaining image file — matches what's
+    # 4. Last resort: the largest remaining image file — matches what's
     #    usually the actual poster/cover art versus a stray small icon.
     return max(candidates, key=lambda f: int(f.get("size") or 0))
 
