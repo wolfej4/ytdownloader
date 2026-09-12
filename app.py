@@ -462,38 +462,93 @@ def browse_episodes(show_id: str) -> dict:
     except Exception as exc:
         raise HTTPException(502, f"Couldn't reach RT Archive: {exc}")
 
-    episodes = []
-    for d in docs:
-        platform = d.get("platform")
-        ai_id = d.get("ai_id") or ""
-        own_url = f"https://archive.org/details/{ai_id}" if ai_id else None
-        rt_url = own_url if platform == "roosterteeth" else None
-        youtube_url = own_url if platform == "youtube" else None
-
-        linked_id = d.get("linked_video_id")
-        linked_platform = d.get("linked_video_platform")
-        if linked_id and linked_platform:
-            linked_url = _archive_ia_url(linked_platform, linked_id)
-            if linked_platform == "roosterteeth" and not rt_url:
-                rt_url = linked_url
-            elif linked_platform == "youtube" and not youtube_url:
-                youtube_url = linked_url
-
-        attrs = (d.get("rt_metadata") or {}).get("attributes") or {}
-
-        episodes.append({
-            "id": d["id"],
-            "title": d.get("title") or d["id"],
-            "date": d.get("sort_date") or d.get("date") or 0,
-            "duration": d.get("duration"),
-            "rt_url": rt_url,
-            "youtube_url": youtube_url,
-            "show": attrs.get("show_title") or fallback_title,
-            "season": attrs.get("season_number"),
-            "episode_number": attrs.get("number"),
-        })
+    episodes = [_shape_episode(d, fallback_show=fallback_title) for d in docs]
     episodes.sort(key=lambda e: e["date"])
     return {"episodes": episodes}
+
+
+def _shape_episode(d: dict, fallback_show: str | None = None) -> dict:
+    platform = d.get("platform")
+    ai_id = d.get("ai_id") or ""
+    own_url = f"https://archive.org/details/{ai_id}" if ai_id else None
+    rt_url = own_url if platform == "roosterteeth" else None
+    youtube_url = own_url if platform == "youtube" else None
+
+    linked_id = d.get("linked_video_id")
+    linked_platform = d.get("linked_video_platform")
+    if linked_id and linked_platform:
+        linked_url = _archive_ia_url(linked_platform, linked_id)
+        if linked_platform == "roosterteeth" and not rt_url:
+            rt_url = linked_url
+        elif linked_platform == "youtube" and not youtube_url:
+            youtube_url = linked_url
+
+    attrs = (d.get("rt_metadata") or {}).get("attributes") or {}
+    shows = d.get("shows") or []
+    show_slug = shows[0] if shows else None
+
+    return {
+        "id": d["id"],
+        "title": d.get("title") or d["id"],
+        "date": d.get("sort_date") or d.get("date") or 0,
+        "duration": d.get("duration"),
+        "rt_url": rt_url,
+        "youtube_url": youtube_url,
+        "show": attrs.get("show_title") or fallback_show
+        or (show_slug.replace("-", " ").title() if show_slug else None),
+        "season": attrs.get("season_number"),
+        "episode_number": attrs.get("number"),
+    }
+
+
+@app.get("/api/browse/episodes")
+def browse_episode_search(q: str = "") -> dict:
+    query = q.strip()
+    if not query:
+        return {"episodes": []}
+
+    # Firestore only supports "starts with" prefix range queries on a field —
+    # no substring/full-text search — and string comparison is case-sensitive,
+    # so try a few common casings (rtarchive.org titles are a mix of ALL CAPS
+    # and Title Case) and merge the results.
+    variants = {query, query.upper(), query.title()}
+    docs_by_id: dict[str, dict] = {}
+    try:
+        for variant in variants:
+            body = {
+                "structuredQuery": {
+                    "from": [{"collectionId": "videos"}],
+                    "where": {"compositeFilter": {"op": "AND", "filters": [
+                        {"fieldFilter": {
+                            "field": {"fieldPath": "title"},
+                            "op": "GREATER_THAN_OR_EQUAL",
+                            "value": {"stringValue": variant},
+                        }},
+                        {"fieldFilter": {
+                            "field": {"fieldPath": "title"},
+                            "op": "LESS_THAN",
+                            "value": {"stringValue": variant + ""},
+                        }},
+                    ]}},
+                    "limit": 40,
+                }
+            }
+            for d in _run_firestore_query(body):
+                docs_by_id[d["id"]] = d
+    except Exception as exc:
+        raise HTTPException(502, f"Couldn't reach RT Archive: {exc}")
+
+    episodes = []
+    for d in docs_by_id.values():
+        # Skip a YouTube-side doc when it's just the mirror of an RT-sourced
+        # episode — that canonical doc will surface on its own and carries
+        # richer metadata (show/season/episode number).
+        if d.get("platform") == "youtube" and d.get("linked_video_platform") == "roosterteeth":
+            continue
+        episodes.append(_shape_episode(d))
+
+    episodes.sort(key=lambda e: (e["title"] or "").lower())
+    return {"episodes": episodes[:100]}
 
 
 # --------------------------------------------------------------------------
