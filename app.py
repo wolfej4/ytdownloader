@@ -582,9 +582,40 @@ def _bracket_id(filename: str) -> str | None:
     return m.group(1) if m else None
 
 
-def _webp_to_jpg(data: bytes) -> bytes | None:
+_IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".webp", ".gif")
+
+
+def _select_ia_thumbnail_file(files: list[dict]) -> dict | None:
+    # Exclude the ".thumbs/" directory archive.org auto-generates for every
+    # video: dozens of tiny per-frame scrubber captures that happen to have
+    # "thumb" in their path but are never the actual poster image.
+    candidates = [
+        f for f in files
+        if f.get("name", "").lower().endswith(_IMAGE_EXTS)
+        and ".thumbs/" not in f.get("name", "").lower()
+    ]
+    if not candidates:
+        return None
+    # 1. archive.org's own canonical "item image" — the most reliable signal
+    #    when present, and always a jpg.
+    exact = next((f for f in candidates if f.get("name", "").lower() == "__ia_thumb.jpg"), None)
+    if exact:
+        return exact
+    # 2. Anything IA itself tagged as the item's tile image.
+    tagged = [f for f in candidates if "item tile" in (f.get("format") or "").lower()]
+    if tagged:
+        return max(tagged, key=lambda f: int(f.get("size") or 0))
+    # 3. Last resort: the largest remaining image file — matches what's
+    #    usually the actual poster/cover art versus a stray small icon.
+    return max(candidates, key=lambda f: int(f.get("size") or 0))
+
+
+def _image_to_jpg(data: bytes, source_name: str) -> bytes | None:
+    if source_name.lower().endswith((".jpg", ".jpeg")):
+        return data
     with tempfile.TemporaryDirectory() as td:
-        src, dst = Path(td) / "in.webp", Path(td) / "out.jpg"
+        src = Path(td) / f"in{Path(source_name).suffix or '.img'}"
+        dst = Path(td) / "out.jpg"
         src.write_bytes(data)
         try:
             result = subprocess.run(
@@ -592,17 +623,17 @@ def _webp_to_jpg(data: bytes) -> bytes | None:
                 capture_output=True, text=True, timeout=30,
             )
         except FileNotFoundError:
-            thumb_log.error("ffmpeg binary %r not found on PATH — can't convert webp to jpg", FFMPEG_BIN)
+            thumb_log.error("ffmpeg binary %r not found on PATH — can't convert %s to jpg", FFMPEG_BIN, source_name)
             return None
         except Exception as exc:
-            thumb_log.error("ffmpeg conversion crashed: %s", exc)
+            thumb_log.error("ffmpeg conversion crashed on %s: %s", source_name, exc)
             return None
         if result.returncode != 0:
-            thumb_log.warning("ffmpeg exited %s converting webp->jpg: %s",
-                               result.returncode, result.stderr.strip()[-500:])
+            thumb_log.warning("ffmpeg exited %s converting %s->jpg: %s",
+                               result.returncode, source_name, result.stderr.strip()[-500:])
             return None
         if not dst.exists():
-            thumb_log.warning("ffmpeg reported success but produced no output file")
+            thumb_log.warning("ffmpeg reported success but produced no output file for %s", source_name)
             return None
         return dst.read_bytes()
 
@@ -617,22 +648,16 @@ def _fetch_ia_thumbnail_jpg(identifier: str) -> bytes | None:
         thumb_log.warning("metadata fetch failed for %s (%s): %s", identifier, meta_url, exc)
         return None
 
-    webp_name = None
-    for f in files:
-        name = f.get("name", "")
-        if name.lower().endswith(".webp") and ("thumb" in name.lower() or "tile" in (f.get("format") or "").lower()):
-            webp_name = name
-            break
-    if not webp_name:
-        webp_name = next((f["name"] for f in files if f.get("name", "").lower().endswith(".webp")), None)
-    if not webp_name:
+    chosen = _select_ia_thumbnail_file(files)
+    if not chosen:
         sample = [f.get("name") for f in files[:15]]
-        thumb_log.warning("no .webp file found in %s's IA metadata (%d files); sample: %s",
+        thumb_log.warning("no image file found in %s's IA metadata (%d files); sample: %s",
                            identifier, len(files), sample)
         return None
-    thumb_log.info("using %s as thumbnail source for %s", webp_name, identifier)
+    name = chosen["name"]
+    thumb_log.info("using %s (%s bytes) as thumbnail source for %s", name, chosen.get("size"), identifier)
 
-    dl_url = f"https://archive.org/download/{identifier}/{webp_name}"
+    dl_url = f"https://archive.org/download/{identifier}/{name}"
     try:
         img = requests.get(dl_url, timeout=30)
         img.raise_for_status()
@@ -640,9 +665,9 @@ def _fetch_ia_thumbnail_jpg(identifier: str) -> bytes | None:
         thumb_log.warning("thumbnail download failed for %s (%s): %s", identifier, dl_url, exc)
         return None
 
-    jpg = _webp_to_jpg(img.content)
+    jpg = _image_to_jpg(img.content, name)
     if jpg is None:
-        thumb_log.warning("webp->jpg conversion failed for %s", identifier)
+        thumb_log.warning("image->jpg conversion failed for %s (source %s)", identifier, name)
     return jpg
 
 
