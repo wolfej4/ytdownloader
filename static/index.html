@@ -251,6 +251,10 @@
     <input type="text" id="showSearch" spellcheck="false" placeholder="Search shows…" />
     <div id="showResults" class="browse-list" style="display:none"></div>
 
+    <input type="text" id="episodeSearch" spellcheck="false"
+           placeholder="…or search episodes directly by title (starts with)"
+           style="margin-top:10px" />
+
     <div id="episodePanel" style="display:none;margin-top:14px">
       <div class="row spread" style="margin-bottom:8px">
         <span class="job-title" id="episodeShowTitle"></span>
@@ -262,6 +266,20 @@
       <div class="row" style="margin-top:12px;justify-content:flex-end">
         <button class="primary" id="queueSelected">Queue selected</button>
       </div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="row spread" style="margin-bottom:10px">
+      <span class="label" style="margin:0">Thumbnails</span>
+    </div>
+    <p class="sub" style="margin:0 0 14px">
+      Scans your download folder for videos missing a sidecar thumbnail, or a
+      show folder missing cover art, and fetches them automatically.
+    </p>
+    <div class="row spread">
+      <button class="primary pref-btn" id="scanThumbs">Scan for missing thumbnails</button>
+      <span class="browse-meta" id="scanStatus"></span>
     </div>
   </div>
 
@@ -539,32 +557,63 @@ $("showResults").addEventListener("click", (e) => {
   loadEpisodes(item.dataset.showId, item.dataset.showTitle);
 });
 
+function renderEpisodes(episodes, headerText, showShowName) {
+  $("episodePanel").style.display = "";
+  $("episodeShowTitle").textContent = headerText;
+  $("selectAllEpisodes").checked = false;
+  currentEpisodes = episodes;
+  const el = $("episodeList");
+  if (!episodes.length) { el.innerHTML = `<div class="empty" style="padding:14px;border:none">No episodes found.</div>`; return; }
+  el.innerHTML = episodes.map((ep, i) => {
+    const se = (ep.season != null && ep.episode_number != null)
+      ? `S${String(ep.season).padStart(2,"0")}E${String(ep.episode_number).padStart(2,"0")} — `
+      : "";
+    const showLine = (showShowName && ep.show)
+      ? `<span class="browse-meta" style="display:block">${escapeHtml(ep.show)}</span>` : "";
+    return `
+    <div class="ep-row">
+      <input type="checkbox" class="ep-check" data-idx="${i}">
+      <span style="min-width:0;flex:1">
+        <span class="browse-meta">${se}</span>${escapeHtml(ep.title)}
+        ${showLine}
+      </span>
+      <span class="ep-badges">
+        <span class="ep-badge ${ep.rt_url ? "avail" : ""}">RT</span>
+        <span class="ep-badge ${ep.youtube_url ? "avail" : ""}">YT</span>
+      </span>
+    </div>`;
+  }).join("");
+}
+
 async function loadEpisodes(showId, showTitle) {
   $("episodePanel").style.display = "";
   $("episodeShowTitle").textContent = showTitle;
-  $("selectAllEpisodes").checked = false;
-  const el = $("episodeList");
-  el.innerHTML = `<div class="empty" style="padding:14px;border:none">Loading…</div>`;
+  $("episodeList").innerHTML = `<div class="empty" style="padding:14px;border:none">Loading…</div>`;
   try {
     const r = await fetch(`/api/browse/shows/${encodeURIComponent(showId)}/episodes`);
     const { episodes } = await r.json();
-    currentEpisodes = episodes;
-    if (!episodes.length) { el.innerHTML = `<div class="empty" style="padding:14px;border:none">No archived episodes found.</div>`; return; }
-    el.innerHTML = episodes.map((ep, i) => {
-      const se = (ep.season != null && ep.episode_number != null)
-        ? `S${String(ep.season).padStart(2,"0")}E${String(ep.episode_number).padStart(2,"0")} — `
-        : "";
-      return `
-      <div class="ep-row">
-        <input type="checkbox" class="ep-check" data-idx="${i}">
-        <span style="min-width:0;flex:1"><span class="browse-meta">${se}</span>${escapeHtml(ep.title)}</span>
-        <span class="ep-badges">
-          <span class="ep-badge ${ep.rt_url ? "avail" : ""}">RT</span>
-          <span class="ep-badge ${ep.youtube_url ? "avail" : ""}">YT</span>
-        </span>
-      </div>`;
-    }).join("");
-  } catch { el.innerHTML = `<div class="empty" style="padding:14px;border:none">Failed to load episodes.</div>`; }
+    renderEpisodes(episodes, showTitle, false);
+  } catch { $("episodeList").innerHTML = `<div class="empty" style="padding:14px;border:none">Failed to load episodes.</div>`; }
+}
+
+let _episodeSearchTimer;
+$("episodeSearch").addEventListener("input", () => {
+  clearTimeout(_episodeSearchTimer);
+  _episodeSearchTimer = setTimeout(searchEpisodesDirect, 350);
+});
+
+async function searchEpisodesDirect() {
+  const q = $("episodeSearch").value.trim();
+  if (!q) { $("episodePanel").style.display = "none"; return; }
+  const header = `Search: "${q}"`;
+  $("episodePanel").style.display = "";
+  $("episodeShowTitle").textContent = header;
+  $("episodeList").innerHTML = `<div class="empty" style="padding:14px;border:none">Searching…</div>`;
+  try {
+    const r = await fetch(`/api/browse/episodes?q=${encodeURIComponent(q)}`);
+    const { episodes } = await r.json();
+    renderEpisodes(episodes, header, true);
+  } catch { $("episodeList").innerHTML = `<div class="empty" style="padding:14px;border:none">Search failed.</div>`; }
 }
 
 $("selectAllEpisodes").onchange = (e) => {
@@ -591,6 +640,39 @@ $("queueSelected").onclick = async () => {
     else { const e = await r.json(); toast(e.detail || "Couldn't queue downloads."); }
   } finally { btn.disabled = false; }
 };
+
+// --- Thumbnail backfill scan ---
+async function pollScanStatus() {
+  try {
+    const r = await fetch("/api/thumbnails/scan");
+    const s = await r.json();
+    const btn = $("scanThumbs");
+    const status = $("scanStatus");
+    if (s.running) {
+      btn.disabled = true;
+      btn.textContent = "Scanning…";
+      status.textContent = `${s.checked}/${s.total} checked · ${s.added} added${s.errors ? ` · ${s.errors} failed` : ""}`;
+    } else {
+      btn.disabled = false;
+      btn.textContent = "Scan for missing thumbnails";
+      status.textContent = s.finished_at
+        ? `Last scan: ${s.checked} checked, ${s.added} added${s.errors ? `, ${s.errors} failed` : ""}.`
+        : "";
+    }
+  } catch { /* keep last state on transient errors */ }
+}
+
+$("scanThumbs").onclick = async () => {
+  try {
+    const r = await fetch("/api/thumbnails/scan", { method: "POST" });
+    if (!r.ok) { const d = await r.json(); toast(d.detail || "Couldn't start scan."); return; }
+    toast("Scanning for missing thumbnails…");
+    pollScanStatus();
+  } catch { toast("Couldn't start scan."); }
+};
+
+pollScanStatus();
+setInterval(pollScanStatus, 1500);
 
 loadConfig();
 refresh();

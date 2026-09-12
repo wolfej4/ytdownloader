@@ -13,6 +13,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -43,6 +44,7 @@ DEFAULT_OUTPUT = os.environ.get("OUTPUT_DIR") or str(
 )
 
 YT_DLP = os.environ.get("YT_DLP_BIN", "yt-dlp")
+FFMPEG_BIN = os.environ.get("FFMPEG_BIN", "ffmpeg")
 SENTINEL = "@@PROG@@"
 
 PROGRESS_TEMPLATE = (
@@ -385,7 +387,7 @@ def get_shows() -> list[dict]:
         return _shows_cache["data"]
 
 
-def _show_thumbnail(show: dict) -> str:
+def _show_thumbnail(show: dict, size: str = "thumb") -> str:
     try:
         images = show["rt_metadata"]["included"]["images"]
     except (KeyError, TypeError):
@@ -395,8 +397,10 @@ def _show_thumbnail(show: dict) -> str:
     for want in ("title_card", "poster", "hero"):
         for im in images:
             if im.get("attributes", {}).get("image_type") == want:
-                return im["attributes"].get("thumb", "")
-    return images[0].get("attributes", {}).get("thumb", "")
+                attrs = im["attributes"]
+                return attrs.get(size) or attrs.get("thumb", "")
+    attrs = images[0].get("attributes", {})
+    return attrs.get(size) or attrs.get("thumb", "")
 
 
 def _run_firestore_query(body: dict) -> list[dict]:
@@ -458,38 +462,280 @@ def browse_episodes(show_id: str) -> dict:
     except Exception as exc:
         raise HTTPException(502, f"Couldn't reach RT Archive: {exc}")
 
-    episodes = []
-    for d in docs:
-        platform = d.get("platform")
-        ai_id = d.get("ai_id") or ""
-        own_url = f"https://archive.org/details/{ai_id}" if ai_id else None
-        rt_url = own_url if platform == "roosterteeth" else None
-        youtube_url = own_url if platform == "youtube" else None
-
-        linked_id = d.get("linked_video_id")
-        linked_platform = d.get("linked_video_platform")
-        if linked_id and linked_platform:
-            linked_url = _archive_ia_url(linked_platform, linked_id)
-            if linked_platform == "roosterteeth" and not rt_url:
-                rt_url = linked_url
-            elif linked_platform == "youtube" and not youtube_url:
-                youtube_url = linked_url
-
-        attrs = (d.get("rt_metadata") or {}).get("attributes") or {}
-
-        episodes.append({
-            "id": d["id"],
-            "title": d.get("title") or d["id"],
-            "date": d.get("sort_date") or d.get("date") or 0,
-            "duration": d.get("duration"),
-            "rt_url": rt_url,
-            "youtube_url": youtube_url,
-            "show": attrs.get("show_title") or fallback_title,
-            "season": attrs.get("season_number"),
-            "episode_number": attrs.get("number"),
-        })
+    episodes = [_shape_episode(d, fallback_show=fallback_title) for d in docs]
     episodes.sort(key=lambda e: e["date"])
     return {"episodes": episodes}
+
+
+def _shape_episode(d: dict, fallback_show: str | None = None) -> dict:
+    platform = d.get("platform")
+    ai_id = d.get("ai_id") or ""
+    own_url = f"https://archive.org/details/{ai_id}" if ai_id else None
+    rt_url = own_url if platform == "roosterteeth" else None
+    youtube_url = own_url if platform == "youtube" else None
+
+    linked_id = d.get("linked_video_id")
+    linked_platform = d.get("linked_video_platform")
+    if linked_id and linked_platform:
+        linked_url = _archive_ia_url(linked_platform, linked_id)
+        if linked_platform == "roosterteeth" and not rt_url:
+            rt_url = linked_url
+        elif linked_platform == "youtube" and not youtube_url:
+            youtube_url = linked_url
+
+    attrs = (d.get("rt_metadata") or {}).get("attributes") or {}
+    shows = d.get("shows") or []
+    show_slug = shows[0] if shows else None
+
+    return {
+        "id": d["id"],
+        "title": d.get("title") or d["id"],
+        "date": d.get("sort_date") or d.get("date") or 0,
+        "duration": d.get("duration"),
+        "rt_url": rt_url,
+        "youtube_url": youtube_url,
+        "show": attrs.get("show_title") or fallback_show
+        or (show_slug.replace("-", " ").title() if show_slug else None),
+        "season": attrs.get("season_number"),
+        "episode_number": attrs.get("number"),
+    }
+
+
+@app.get("/api/browse/episodes")
+def browse_episode_search(q: str = "") -> dict:
+    query = q.strip()
+    if not query:
+        return {"episodes": []}
+
+    # Firestore only supports "starts with" prefix range queries on a field —
+    # no substring/full-text search — and string comparison is case-sensitive,
+    # so try a few common casings (rtarchive.org titles are a mix of ALL CAPS
+    # and Title Case) and merge the results.
+    variants = {query, query.upper(), query.title()}
+    docs_by_id: dict[str, dict] = {}
+    try:
+        for variant in variants:
+            body = {
+                "structuredQuery": {
+                    "from": [{"collectionId": "videos"}],
+                    "where": {"compositeFilter": {"op": "AND", "filters": [
+                        {"fieldFilter": {
+                            "field": {"fieldPath": "title"},
+                            "op": "GREATER_THAN_OR_EQUAL",
+                            "value": {"stringValue": variant},
+                        }},
+                        {"fieldFilter": {
+                            "field": {"fieldPath": "title"},
+                            "op": "LESS_THAN",
+                            "value": {"stringValue": variant + ""},
+                        }},
+                    ]}},
+                    "limit": 40,
+                }
+            }
+            for d in _run_firestore_query(body):
+                docs_by_id[d["id"]] = d
+    except Exception as exc:
+        raise HTTPException(502, f"Couldn't reach RT Archive: {exc}")
+
+    episodes = []
+    for d in docs_by_id.values():
+        # Skip a YouTube-side doc when it's just the mirror of an RT-sourced
+        # episode — that canonical doc will surface on its own and carries
+        # richer metadata (show/season/episode number).
+        if d.get("platform") == "youtube" and d.get("linked_video_platform") == "roosterteeth":
+            continue
+        episodes.append(_shape_episode(d))
+
+    episodes.sort(key=lambda e: (e["title"] or "").lower())
+    return {"episodes": episodes[:100]}
+
+
+# --------------------------------------------------------------------------
+# Thumbnail backfill scan — walks already-downloaded videos, adding a
+# sidecar .jpg (fetched from archive.org) for any that lack one, and a
+# folder.jpg (fetched from the rtarchive.org show catalog) per show folder.
+# --------------------------------------------------------------------------
+VIDEO_EXTS = (".mkv", ".mp4", ".webm", ".mov", ".avi")
+_BRACKET_ID_RE = re.compile(r"\[([^\[\]]+)\]\.[A-Za-z0-9]+$")
+_IA_ID_RE = re.compile(r"^(roosterteeth|youtube)-")
+
+_thumb_scan_lock = threading.Lock()
+_thumb_scan_state: dict = {
+    "running": False, "checked": 0, "total": 0,
+    "added": 0, "errors": 0, "finished_at": None,
+}
+
+
+def _bracket_id(filename: str) -> str | None:
+    m = _BRACKET_ID_RE.search(filename)
+    return m.group(1) if m else None
+
+
+def _webp_to_jpg(data: bytes) -> bytes | None:
+    with tempfile.TemporaryDirectory() as td:
+        src, dst = Path(td) / "in.webp", Path(td) / "out.jpg"
+        src.write_bytes(data)
+        try:
+            subprocess.run(
+                [FFMPEG_BIN, "-y", "-loglevel", "error", "-i", str(src), str(dst)],
+                check=True, timeout=30,
+            )
+        except Exception:
+            return None
+        return dst.read_bytes() if dst.exists() else None
+
+
+def _fetch_ia_thumbnail_jpg(identifier: str) -> bytes | None:
+    try:
+        resp = requests.get(f"https://archive.org/metadata/{identifier}", timeout=20)
+        resp.raise_for_status()
+        files = resp.json().get("files", [])
+    except Exception:
+        return None
+
+    webp_name = None
+    for f in files:
+        name = f.get("name", "")
+        if name.lower().endswith(".webp") and ("thumb" in name.lower() or "tile" in (f.get("format") or "").lower()):
+            webp_name = name
+            break
+    if not webp_name:
+        webp_name = next((f["name"] for f in files if f.get("name", "").lower().endswith(".webp")), None)
+    if not webp_name:
+        return None
+
+    try:
+        img = requests.get(f"https://archive.org/download/{identifier}/{webp_name}", timeout=30)
+        img.raise_for_status()
+    except Exception:
+        return None
+    return _webp_to_jpg(img.content)
+
+
+def _lookup_show_poster(folder_name: str) -> bytes | None:
+    try:
+        shows = get_shows()
+    except Exception:
+        return None
+    needle = folder_name.strip().lower()
+    match = next((s for s in shows if (s.get("title") or "").strip().lower() == needle), None)
+    if not match:
+        return None
+    url = _show_thumbnail(match, size="large") or _show_thumbnail(match)
+    if not url:
+        return None
+    try:
+        r = requests.get(url, timeout=30)
+        r.raise_for_status()
+        return r.content
+    except Exception:
+        return None
+
+
+def _fpath_exists(kind: str, dirpath: str, filename: str) -> bool:
+    if kind == "smb":
+        return smbclient.path.exists(f"{dirpath}\\{filename}")
+    return (Path(dirpath) / filename).exists()
+
+
+def _fwrite_bytes(kind: str, dirpath: str, filename: str, data: bytes) -> None:
+    if kind == "smb":
+        with smbclient.open_file(f"{dirpath}\\{filename}", mode="wb") as fh:
+            fh.write(data)
+    else:
+        (Path(dirpath) / filename).write_bytes(data)
+
+
+def _iter_video_files():
+    """Yield (kind, dirpath, filename, root) for every video in the active storage location."""
+    with _smb_lock:
+        use_smb = _smb_connected
+    if use_smb:
+        root = _smb_unc()
+        for dirpath, _dirs, files in smbclient.walk(root):
+            for fn in files:
+                if fn.lower().endswith(VIDEO_EXTS):
+                    yield "smb", dirpath, fn, root
+    else:
+        root = config["output_dir"]
+        root_path = Path(root)
+        if not root_path.exists():
+            return
+        for p in root_path.rglob("*"):
+            if p.is_file() and p.suffix.lower() in VIDEO_EXTS:
+                yield "local", str(p.parent), p.name, root
+
+
+def _show_folder_name(kind: str, dirpath: str, root: str) -> str | None:
+    root_norm = root.rstrip("\\/")
+    dirpath_norm = dirpath.rstrip("\\/")
+    if dirpath_norm == root_norm:
+        return None
+    sep = "\\" if kind == "smb" else os.sep
+    return dirpath_norm.replace("/", sep).rsplit(sep, 1)[-1]
+
+
+def _run_thumbnail_scan() -> None:
+    videos = list(_iter_video_files())
+    with _thumb_scan_lock:
+        _thumb_scan_state.update(running=True, checked=0, total=len(videos),
+                                  added=0, errors=0, finished_at=None)
+
+    seen_folders: set = set()
+    try:
+        for kind, dirpath, filename, root in videos:
+            with _thumb_scan_lock:
+                _thumb_scan_state["checked"] += 1
+
+            base = filename.rsplit(".", 1)[0]
+            jpg_name = f"{base}.jpg"
+            vid_id = _bracket_id(filename)
+            if vid_id and _IA_ID_RE.match(vid_id) and not _fpath_exists(kind, dirpath, jpg_name):
+                data = _fetch_ia_thumbnail_jpg(vid_id)
+                with _thumb_scan_lock:
+                    if data:
+                        try:
+                            _fwrite_bytes(kind, dirpath, jpg_name, data)
+                            _thumb_scan_state["added"] += 1
+                        except Exception:
+                            _thumb_scan_state["errors"] += 1
+                    else:
+                        _thumb_scan_state["errors"] += 1
+
+            folder_key = (kind, dirpath)
+            if folder_key not in seen_folders:
+                seen_folders.add(folder_key)
+                show_name = _show_folder_name(kind, dirpath, root)
+                if show_name and not _fpath_exists(kind, dirpath, "folder.jpg"):
+                    poster = _lookup_show_poster(show_name)
+                    if poster:
+                        try:
+                            _fwrite_bytes(kind, dirpath, "folder.jpg", poster)
+                            with _thumb_scan_lock:
+                                _thumb_scan_state["added"] += 1
+                        except Exception:
+                            with _thumb_scan_lock:
+                                _thumb_scan_state["errors"] += 1
+    finally:
+        with _thumb_scan_lock:
+            _thumb_scan_state["running"] = False
+            _thumb_scan_state["finished_at"] = time.time()
+
+
+@app.post("/api/thumbnails/scan")
+def start_thumbnail_scan() -> dict:
+    with _thumb_scan_lock:
+        if _thumb_scan_state["running"]:
+            raise HTTPException(409, "A scan is already running.")
+    threading.Thread(target=_run_thumbnail_scan, daemon=True).start()
+    return {"started": True}
+
+
+@app.get("/api/thumbnails/scan")
+def get_thumbnail_scan_status() -> dict:
+    with _thumb_scan_lock:
+        return dict(_thumb_scan_state)
 
 
 class DownloadItem(BaseModel):
