@@ -195,8 +195,14 @@
   }
   .ep-row:last-child { border-bottom: none; }
   .ep-badges { display: flex; gap: 4px; margin-left: auto; font-family: var(--mono); font-size: 10px; flex-shrink: 0; }
-  .ep-badge { padding: 2px 6px; border-radius: 10px; border: 1px solid var(--line); color: var(--muted); }
-  .ep-badge.avail { color: var(--ok); border-color: #38492c; }
+  .ep-badge {
+    padding: 2px 6px; border-radius: 10px; border: 1px solid var(--line); color: var(--muted);
+    background: none; font-family: var(--mono); font-size: 10px; line-height: 1.4;
+  }
+  .ep-badge.avail { color: var(--ok); border-color: #38492c; cursor: pointer; }
+  .ep-badge.avail:hover { border-color: var(--ok); }
+  .ep-badge.selected { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .ep-badge:disabled { cursor: not-allowed; opacity: .6; }
 </style>
 </head>
 <body>
@@ -548,10 +554,26 @@ async function refresh() {
 let currentPref = "roosterteeth";
 let currentEpisodes = [];
 
+function defaultPlatform(ep) {
+  if (currentPref === "youtube" && ep.youtube_url) return "youtube";
+  if (currentPref === "roosterteeth" && ep.rt_url) return "roosterteeth";
+  return ep.rt_url ? "roosterteeth" : (ep.youtube_url ? "youtube" : null);
+}
+
 function setPref(p) {
   currentPref = p;
   $("prefRt").classList.toggle("active", p === "roosterteeth");
   $("prefYt").classList.toggle("active", p === "youtube");
+  // Re-apply the new default to every row that's currently shown, so the
+  // global toggle affects the whole visible list at once.
+  currentEpisodes.forEach(ep => { ep.selected = defaultPlatform(ep); });
+  $("episodeList").querySelectorAll(".ep-row").forEach((row, i) => {
+    const ep = currentEpisodes[i];
+    if (!ep) return;
+    row.querySelectorAll(".ep-badge").forEach(b => {
+      b.classList.toggle("selected", b.dataset.platform === ep.selected);
+    });
+  });
 }
 $("prefRt").onclick = () => setPref("roosterteeth");
 $("prefYt").onclick = () => setPref("youtube");
@@ -597,11 +619,18 @@ function renderEpisodes(episodes, headerText, showShowName) {
   const el = $("episodeList");
   if (!episodes.length) { el.innerHTML = `<div class="empty" style="padding:14px;border:none">No episodes found.</div>`; return; }
   el.innerHTML = episodes.map((ep, i) => {
+    ep.selected = defaultPlatform(ep);
     const se = (ep.season != null && ep.episode_number != null)
       ? `S${String(ep.season).padStart(2,"0")}E${String(ep.episode_number).padStart(2,"0")} — `
       : "";
     const showLine = (showShowName && ep.show)
       ? `<span class="browse-meta" style="display:block">${escapeHtml(ep.show)}</span>` : "";
+    const rtBtn = `<button type="button" class="ep-badge ${ep.rt_url ? "avail" : ""} ${ep.selected === "roosterteeth" ? "selected" : ""}"
+        data-idx="${i}" data-platform="roosterteeth" ${ep.rt_url ? "" : "disabled"}
+        title="${ep.rt_url ? "Use the Website source" : "Not available on the Website"}">RT</button>`;
+    const ytBtn = `<button type="button" class="ep-badge ${ep.youtube_url ? "avail" : ""} ${ep.selected === "youtube" ? "selected" : ""}"
+        data-idx="${i}" data-platform="youtube" ${ep.youtube_url ? "" : "disabled"}
+        title="${ep.youtube_url ? "Use the YouTube source" : "Not available on YouTube"}">YT</button>`;
     return `
     <div class="ep-row">
       <input type="checkbox" class="ep-check" data-idx="${i}">
@@ -609,10 +638,7 @@ function renderEpisodes(episodes, headerText, showShowName) {
         <span class="browse-meta">${se}</span>${escapeHtml(ep.title)}
         ${showLine}
       </span>
-      <span class="ep-badges">
-        <span class="ep-badge ${ep.rt_url ? "avail" : ""}">RT</span>
-        <span class="ep-badge ${ep.youtube_url ? "avail" : ""}">YT</span>
-      </span>
+      <span class="ep-badges">${rtBtn}${ytBtn}</span>
     </div>`;
   }).join("");
 }
@@ -652,13 +678,24 @@ $("selectAllEpisodes").onchange = (e) => {
   $("episodeList").querySelectorAll(".ep-check").forEach(cb => cb.checked = e.target.checked);
 };
 
+$("episodeList").addEventListener("click", (e) => {
+  const badge = e.target.closest(".ep-badge");
+  if (!badge || badge.disabled) return;
+  const ep = currentEpisodes[+badge.dataset.idx];
+  if (!ep) return;
+  ep.selected = badge.dataset.platform;
+  badge.closest(".ep-row").querySelectorAll(".ep-badge").forEach(b => {
+    b.classList.toggle("selected", b.dataset.platform === ep.selected);
+  });
+});
+
 $("queueSelected").onclick = async () => {
   const checks = [...$("episodeList").querySelectorAll(".ep-check:checked")];
   if (!checks.length) { toast("Select at least one episode."); return; }
   const items = [];
   for (const cb of checks) {
     const ep = currentEpisodes[+cb.dataset.idx];
-    const url = (currentPref === "youtube" ? ep.youtube_url : ep.rt_url) || ep.youtube_url || ep.rt_url;
+    const url = ep.selected === "youtube" ? ep.youtube_url : ep.rt_url;
     if (url) items.push({ url, show: ep.show, season: ep.season, episode: ep.episode_number });
   }
   if (!items.length) { toast("None of the selected episodes are archived."); return; }
