@@ -134,6 +134,8 @@
   .job-btn.cancel:hover { background: var(--accent-d); color: #fff; }
   .job-btn.retry { color: var(--warn); border-color: #5a3e10; }
   .job-btn.retry:hover { background: #3a2808; color: var(--warn); }
+  .job-btn.remove { color: var(--muted); }
+  .job-btn.remove:hover { background: var(--line); color: var(--text); }
 
   .bar { height: 6px; background: var(--bg); border-radius: 4px; margin: 11px 0 8px; overflow: hidden; }
   .bar > span {
@@ -286,6 +288,7 @@
   <h2 class="section">
     Transfers
     <span class="section-btns">
+      <button class="clear-btn" id="retryFailed">Retry failed</button>
       <button class="clear-btn" id="clearDone">Clear successful</button>
       <button class="clear-btn" id="clear">Clear all</button>
     </span>
@@ -393,6 +396,16 @@ $("start").onclick = async () => {
 $("clear").onclick = async () => { await fetch("/api/jobs/clear", { method: "POST" }); refresh(); };
 $("clearDone").onclick = async () => { await fetch("/api/jobs/clear/done", { method: "POST" }); refresh(); };
 
+$("retryFailed").onclick = async () => {
+  const btn = $("retryFailed"); btn.disabled = true;
+  try {
+    const r = await fetch("/api/jobs/retry/failed", { method: "POST" });
+    const d = await r.json();
+    if (r.ok) { toast(d.retried ? `Retrying ${d.retried} failed item${d.retried > 1 ? "s" : ""}.` : "No failed downloads to retry."); refresh(); }
+    else { toast(d.detail || "Couldn't retry failed downloads."); }
+  } finally { btn.disabled = false; }
+};
+
 // Event delegation for per-job buttons
 $("jobs").addEventListener("click", async (e) => {
   const btn = e.target.closest("[data-action]");
@@ -400,7 +413,9 @@ $("jobs").addEventListener("click", async (e) => {
   const { action, jobId } = btn.dataset;
   btn.disabled = true;
   try {
-    const r = await fetch(`/api/jobs/${jobId}/${action}`, { method: "POST" });
+    const r = action === "remove"
+      ? await fetch(`/api/jobs/${jobId}`, { method: "DELETE" })
+      : await fetch(`/api/jobs/${jobId}/${action}`, { method: "POST" });
     if (!r.ok) { const d = await r.json(); toast(d.detail || "Failed."); }
     else { refresh(); }
   } catch { toast("Request failed."); }
@@ -412,6 +427,7 @@ function row(j) {
   const counter = (j.total && j.total > 1) ? ` · item ${j.current || 0}/${j.total}` : "";
   const pct = j.percent != null ? j.percent : 0;
   const active = ["queued", "running", "uploading"].includes(j.status);
+  const finished = ["done", "error", "cancelled"].includes(j.status);
   const retryable = ["error", "cancelled"].includes(j.status);
 
   const cancelBtn = active
@@ -419,6 +435,9 @@ function row(j) {
     : "";
   const retryBtn = retryable
     ? `<button class="job-btn retry" data-action="retry" data-job-id="${j.id}">Retry</button>`
+    : "";
+  const removeBtn = finished
+    ? `<button class="job-btn remove" data-action="remove" data-job-id="${j.id}" title="Remove from list">✕</button>`
     : "";
 
   const err = j.status === "error" && j.error ? `<div class="err">${escapeHtml(j.error)}</div>` : "";
@@ -435,7 +454,7 @@ function row(j) {
         <div class="job-url">${escapeHtml(j.url)}</div>
       </div>
       <div class="job-right">
-        ${cancelBtn}${retryBtn}
+        ${cancelBtn}${retryBtn}${removeBtn}
         <div class="job-state ${j.status}">${j.status}</div>
       </div>
     </div>
