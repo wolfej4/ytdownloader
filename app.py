@@ -977,6 +977,13 @@ def cancel_job(job_id: str) -> dict:
     return {"cancelled": True}
 
 
+def _retry_job(job_id: str) -> None:
+    _set(job_id,
+         status="queued", percent=0.0, percent_str="", speed="", eta="",
+         error="", current=None, total=None, thumbnail_url="", queued_at=time.time())
+    work_queue.put(job_id)
+
+
 @app.post("/api/jobs/{job_id}/retry")
 def retry_job(job_id: str) -> dict:
     with jobs_lock:
@@ -985,11 +992,29 @@ def retry_job(job_id: str) -> dict:
         raise HTTPException(404, "Job not found.")
     if job["status"] not in ("error", "cancelled"):
         raise HTTPException(400, "Only errored or cancelled jobs can be retried.")
-    _set(job_id,
-         status="queued", percent=0.0, percent_str="", speed="", eta="",
-         error="", current=None, total=None, thumbnail_url="", queued_at=time.time())
-    work_queue.put(job_id)
+    _retry_job(job_id)
     return {"retried": True}
+
+
+@app.post("/api/jobs/retry/failed")
+def retry_failed_jobs() -> dict:
+    with jobs_lock:
+        job_ids = [j["id"] for j in jobs.values() if j["status"] == "error"]
+    for job_id in job_ids:
+        _retry_job(job_id)
+    return {"retried": len(job_ids)}
+
+
+@app.delete("/api/jobs/{job_id}")
+def remove_job(job_id: str) -> dict:
+    with jobs_lock:
+        job = jobs.get(job_id)
+        if not job:
+            raise HTTPException(404, "Job not found.")
+        if job["status"] not in ("done", "error", "cancelled"):
+            raise HTTPException(400, "Cancel the download before removing it.")
+        del jobs[job_id]
+    return {"removed": True}
 
 
 class SmbConnectRequest(BaseModel):
