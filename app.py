@@ -464,7 +464,7 @@ def browse_episodes(show_id: str) -> dict:
                 "op": "ARRAY_CONTAINS",
                 "value": {"stringValue": show_id},
             }},
-            "limit": 1000,
+            "limit": 5000,
         }
     }
     try:
@@ -921,7 +921,7 @@ def submit(req: DownloadRequest) -> dict:
         raise HTTPException(400, "No URLs provided.")
     created = []
     for item in items:
-        job_id = uuid.uuid4().hex[:8]
+        job_id = uuid.uuid4().hex
         with jobs_lock:
             jobs[job_id] = {
                 "id": job_id, "url": item.url.strip(), "status": "queued",
