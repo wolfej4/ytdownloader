@@ -54,6 +54,8 @@ Open `http://127.0.0.1:8765`. On Windows, `winget install Gyan.FFmpeg` is one wa
 
 Filters operate on loaded catalog records. Load all pages before selecting an entire show. The displayed loaded, matching, and selected counts make the selection scope visible. Some catalog episodes have no archived source and cannot be queued. Website and YouTube mirrors are merged when their catalog links identify the same episode.
 
+The transfer list requests 50 jobs at a time. Search, status totals, and batch summaries use indexed database fields. Logs load when their Log panel is opened. Live progress updates reuse existing transfer cards, preserving open logs and focused controls. Automatic polling pauses while the browser tab is hidden and refreshes when it becomes visible. Workers continue downloading in the background.
+
 ## Recovery, duplicate handling, and delivery
 
 SQLite at `/config/state.sqlite3` is the queue and history authority. Jobs, source aliases, destination snapshots, retry state, and followed shows survive app and container restarts. Interrupted downloads are requeued and yt-dlp resumes compatible partial files from their staging directory. Interrupted uploads reuse the completed local files.
@@ -119,6 +121,8 @@ This feed provides a pause signal. Pool expansion, reclaiming space, filesystem 
 ## Updating and backups
 
 Back up `/config` and preserve `/staging` for interrupted jobs. Stop RT Grabber when copying its SQLite database, or use SQLite’s backup facilities to produce a consistent live backup. A raw copy of just `state.sqlite3` while its WAL is active can omit recent transactions. Protect configuration and database backups because saved SMB credentials and notification tokens are stored there.
+
+The performance update adds database summary columns and indexes automatically at startup. Existing job records are backfilled once. When rolling back to a version from before this schema update, restore its matching database backup.
 
 Update from your checked-out deployment branch and rebuild.
 

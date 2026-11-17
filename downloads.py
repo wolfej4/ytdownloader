@@ -18,8 +18,6 @@ from urllib.parse import parse_qs, unquote, urlsplit
 import requests
 import smbclient
 
-from state import ACTIVE
-
 log = logging.getLogger("rt-grabber.downloads")
 VIDEO_EXTS = {".mkv", ".mp4", ".webm", ".mov", ".avi"}
 PROGRESS = "@@PROG@@"
@@ -160,16 +158,15 @@ class DownloadManager:
             if self.in_flight:
                 raise OSError("Workers are still stopping. Resume again shortly.")
         self.check_storage()
-        for job in self.store.jobs():
-            if job["status"] == "paused":
-                self.store.update(job["id"], status="queued", next_attempt_at=0, error="")
+        for job in self.store.jobs_by_status(("paused",)):
+            self.store.update(job["id"], status="queued", next_attempt_at=0, error="")
         self.store.set_setting("paused", False)
         self.store.set_setting("pause_reason", "")
         self.storage_error = ""
         self.runtime_paused = False
         self.wake.set()
 
-    def check_storage(self, job=None):
+    def check_storage(self, job=None, paths=None):
         status_file = self.config.get("pool_status_file", "")
         if status_file:
             try:
@@ -185,13 +182,14 @@ class DownloadManager:
             except (OSError, ValueError, KeyError, TypeError) as exc:
                 raise OSError(f"Proxmox pool guard: {exc}") from exc
         minimum = self.config["min_free_gb"]
-        paths = [self.config["staging_dir"]]
-        if job:
-            paths = [job["staging_root"]]
-            if job["target"]["kind"] == "local":
-                paths.append(job["target"]["path"])
-        elif not self.config.get("smb", {}).get("host"):
-            paths.append(self.config["output_dir"])
+        if paths is None:
+            paths = [self.config["staging_dir"]]
+            if job:
+                paths = [job["staging_root"]]
+                if job["target"]["kind"] == "local":
+                    paths.append(job["target"]["path"])
+            elif not self.config.get("smb", {}).get("host"):
+                paths.append(self.config["output_dir"])
         return [storage_check(path, minimum) for path in dict.fromkeys(paths)]
 
     def control(self, job_id):
@@ -235,11 +233,14 @@ class DownloadManager:
     def monitor(self):
         while not self.stop_event.wait(3):
             try:
-                active = [j for j in self.store.jobs() if j["status"] in ("running", "uploading")]
+                active = self.store.jobs_by_status(("running", "uploading"))
                 if active and not self.runtime_paused:
-                    self.check_storage()
+                    paths = [self.config["staging_dir"]]
                     for job in active:
-                        self.check_storage(job)
+                        paths.append(job["staging_root"])
+                        if job["target"]["kind"] == "local":
+                            paths.append(job["target"]["path"])
+                    self.check_storage(paths=paths)
             except (OSError, sqlite3.Error) as exc:
                 log.error("Storage guard paused transfers: %s", exc)
                 try:
@@ -477,13 +478,12 @@ class DownloadManager:
 
     def notify_batch(self, batch_id):
         with self.notification_lock:
-            jobs = [j for j in self.store.jobs() if j["batch_id"] == batch_id]
-            if not jobs or any(j["status"] in ACTIVE for j in jobs):
+            summaries = self.store.batches(batch_id=batch_id)
+            if not summaries or summaries[0]["active"]:
                 return
+            batch = summaries[0]
             marker = "notified:" + batch_id
             if self.store.setting(marker, False):
                 return
-            done = sum(j["status"] == "done" for j in jobs)
-            failed = sum(j["status"] == "error" for j in jobs)
-            if self.notify("Batch finished", f"{done} completed, {failed} failed, {len(jobs) - done - failed} cancelled."):
+            if self.notify("Batch finished", f"{batch['done']} completed, {batch['error']} failed, {batch['cancelled']} cancelled."):
                 self.store.set_setting(marker, True)

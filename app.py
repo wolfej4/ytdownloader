@@ -196,7 +196,9 @@ def _fetch_all_shows() -> list[dict]:
     shows: list[dict] = []
     page_token = None
     while True:
-        params = {"pageSize": 300}
+        params = {"pageSize": 300, "mask.fieldPaths": [
+            "title", "rt_episode_count", "rt_metadata.included.images",
+        ]}
         if page_token:
             params["pageToken"] = page_token
         resp = requests.get(f"{FIRESTORE_URL}/shows", params=params, timeout=20)
@@ -240,6 +242,12 @@ def _show_thumbnail(show: dict, size: str = "thumb") -> str:
 
 
 def _run_firestore_query(body: dict) -> list[dict]:
+    query = dict(body["structuredQuery"])
+    query.setdefault("select", {"fields": [{"fieldPath": field} for field in (
+        "title", "sort_date", "date", "duration", "platform", "ai_id",
+        "linked_video_id", "linked_video_platform", "shows", "description", "rt_metadata.attributes",
+    )]})
+    body = {**body, "structuredQuery": query}
     resp = requests.post(f"{FIRESTORE_URL}:runQuery", json=body, timeout=20)
     resp.raise_for_status()
     return [_fs_doc(row["document"]) for row in resp.json() if "document" in row]
@@ -850,37 +858,32 @@ def submit(req: DownloadRequest) -> dict:
     return result
 
 
-def public_job(job):
-    return {key: value for key, value in job.items() if key not in ("target",)}
+def public_job(job, include_logs=True):
+    result = {key: value for key, value in job.items() if key != "target" and (include_logs or key != "log")}
+    result["has_log"] = bool(job.get("log"))
+    return result
 
 
 @app.get("/api/jobs")
 def list_jobs(q: str = "", status: str = "", offset: int = Query(0, ge=0),
-              limit: int | None = Query(None, ge=1, le=5000)) -> dict:
-    all_jobs = store.jobs()
-    counts = {state: 0 for state in (*ACTIVE, *FINISHED)}
-    for job in all_jobs:
-        counts[job["status"]] += 1
-    filtered = [job for job in all_jobs if (not status or job["status"] == status)
-                and q.casefold() in " ".join(str(job.get(key) or "") for key in ("title", "show", "url", "error")).casefold()]
-    page = filtered[offset:offset + limit] if limit else filtered[offset:]
-    return {"jobs": [public_job(job) for job in page], "total": len(filtered), "counts": counts,
-            "completed_bytes": sum(j.get("delivered_bytes", 0) for j in all_jobs if j["status"] == "done"),
+              limit: int | None = Query(None, ge=1, le=5000), include_logs: bool = True) -> dict:
+    page, total = store.job_page(q, status, offset, limit)
+    counts, completed_bytes = store.summary()
+    return {"jobs": [public_job(job, include_logs) for job in page], "total": total, "counts": counts,
+            "completed_bytes": completed_bytes,
             "paused": manager.runtime_paused or store.setting("paused", False),
             "pause_reason": manager.storage_error or store.setting("pause_reason", ""),
             "notification_error": manager.last_notification_error}
 
 
 @app.get("/api/batches")
-def list_batches():
-    batches = {}
-    for job in store.jobs():
-        batch = batches.setdefault(job["batch_id"], {"id": job["batch_id"], "total": 0, "done": 0,
-                  "error": 0, "cancelled": 0, "active": 0, "bytes": 0, "queued_at": job["queued_at"]})
-        batch["total"] += 1
-        batch[job["status"] if job["status"] in FINISHED else "active"] += 1
-        batch["bytes"] += job.get("delivered_bytes", 0)
-    return {"batches": list(batches.values())}
+def list_batches(limit: int | None = Query(None, ge=1, le=5000)):
+    return {"batches": store.batches(limit=limit)}
+
+
+@app.get("/api/jobs/{job_id}/logs")
+def job_logs(job_id: str):
+    return {"log": _job(job_id).get("log", [])}
 
 
 @app.post("/api/queue/pause")
