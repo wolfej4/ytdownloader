@@ -745,7 +745,7 @@ class DownloadItem(BaseModel):
 class DownloadRequest(BaseModel):
     urls: list[str] = Field(default_factory=list)
     items: list[DownloadItem] = Field(default_factory=list)
-    redownload: bool = False
+    redownload: bool = True
 
 
 class ConfigRequest(BaseModel):
