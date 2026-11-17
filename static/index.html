@@ -515,10 +515,8 @@ async function refresh() {
       return;
     }
 
-    const jobIds = jobs.map(j => j.id);
-    const domIds = [...el.querySelectorAll(".job[data-job-id]")].map(e => e.dataset.jobId);
-
-    if (JSON.stringify(jobIds) !== JSON.stringify(domIds)) {
+    const cards = el.querySelectorAll(".job[data-job-id]");
+    if (cards.length !== jobs.length || jobs.some((j, i) => j.id !== cards[i].dataset.jobId)) {
       // List order or membership changed — full rebuild
       el.innerHTML = jobs.map(row).join("");
       _structKeys = {};
@@ -526,10 +524,8 @@ async function refresh() {
       return;
     }
 
-    for (const j of jobs) {
-      const card = el.querySelector(`.job[data-job-id="${j.id}"]`);
-      if (!card) continue;
-
+    for (const [i, j] of jobs.entries()) {
+      const card = cards[i];
       const sk = structKey(j);
       if (_structKeys[j.id] !== sk) {
         // Structure changed (title resolved, thumbnail appeared, status flipped, etc.)
@@ -538,7 +534,7 @@ async function refresh() {
         tmp.innerHTML = row(j);
         card.replaceWith(tmp.firstElementChild);
         _structKeys[j.id] = sk;
-      } else {
+      } else if (j.status === "running") {
         // Only live progress changed — update bar and stats without touching the img
         const pct = j.percent != null ? j.percent : 0;
         const barSpan = card.querySelector(".bar > span");
@@ -650,7 +646,7 @@ async function loadEpisodes(showId, showTitle) {
   try {
     const r = await fetch(`/api/browse/shows/${encodeURIComponent(showId)}/episodes`);
     const { episodes } = await r.json();
-    renderEpisodes(episodes, showTitle, false);
+    renderEpisodes(episodes, `${showTitle} (${episodes.length.toLocaleString()} episodes)`, false);
   } catch { $("episodeList").innerHTML = `<div class="empty" style="padding:14px;border:none">Failed to load episodes.</div>`; }
 }
 
