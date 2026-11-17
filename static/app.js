@@ -26,7 +26,7 @@ function action(id, handler) {
     catch (error) { toast(error.message); }
     finally {
       button.disabled = false;
-      if (["loadMoreEpisodes", "loadAllEpisodes", "queueSelected", "redownloadSelected"].includes(id)) renderEpisodes();
+      if (["loadMoreEpisodes", "loadAllEpisodes", "queueSelected"].includes(id)) renderEpisodes();
     }
   };
 }
@@ -75,16 +75,13 @@ action("smbDisconnect", async () => { await api("/api/smb/disconnect", {}); awai
 action("start", async () => {
   const urls = $("urls").value.split("\n").map(url => url.trim()).filter(Boolean);
   if (!urls.length) throw new Error("Add at least one URL.");
-  const redownload = $("redownloadUrls").checked;
-  const result = await api("/api/download", {urls, redownload});
+  const result = await api("/api/download", {urls});
   $("urls").value = "";
-  $("redownloadUrls").checked = false;
-  queuedToast(result, redownload);
+  queuedToast(result);
   await refresh();
 });
-function queuedToast(result, redownload = false) {
-  const skipped = redownload ? "already in the queue" : "already downloaded or in the queue";
-  toast(`Queued ${result.created.length.toLocaleString()} items; ${result.skipped.toLocaleString()} ${skipped}.`);
+function queuedToast(result) {
+  toast(`Queued ${result.created.length.toLocaleString()} items; ${result.skipped.toLocaleString()} already queued or awaiting retry.`);
 }
 
 let currentPref = "roosterteeth";
@@ -220,7 +217,6 @@ function renderEpisodes() {
   $("loadAllEpisodes").disabled = catalogLoading || !catalog.cursor;
   $("followShow").disabled = !catalog.showId;
   $("queueSelected").disabled = selected === 0;
-  $("redownloadSelected").disabled = selected === 0;
   const available = filtered.filter(episode => episode.selected);
   $("selectAllEpisodes").checked = available.length > 0 && available.every(episode => episode.checked);
   $("selectAllEpisodes").indeterminate = available.some(episode => episode.checked) && !$("selectAllEpisodes").checked;
@@ -239,20 +235,19 @@ $("episodeList").addEventListener("click", event => {
   const badge = event.target.closest(".ep-badge");
   if (badge && !badge.disabled) { currentEpisodes[Number(badge.dataset.idx)].selected = badge.dataset.platform; renderEpisodes(); }
 });
-async function queueSelected(redownload = false) {
+async function queueSelected() {
   const selected = currentEpisodes.filter(episode => episode.checked);
   const items = selected.map(episode => ({url: episode.selected === "youtube" ? episode.youtube_url : episode.rt_url, keys: episode.keys,
     show: episode.show, season: episode.season, episode: episode.episode_number, title: episode.title, description: episode.description, release_date: episode.release_date}));
-  const result = await api("/api/download", {items, redownload});
-  queuedToast(result, redownload);
+  const result = await api("/api/download", {items});
+  queuedToast(result);
   selected.forEach(episode => {
     episode.checked = false;
-    if (redownload || episode.download_status !== "downloaded") episode.download_status = "queued";
+    episode.download_status = "queued";
   });
   renderEpisodes(); await refresh();
 }
 action("queueSelected", () => queueSelected());
-action("redownloadSelected", () => queueSelected(true));
 
 action("followShow", async () => {
   await api("/api/follows", {show_id: catalog.showId, title: catalog.title, preference: currentPref, interval_hours: Number($("followHours").value), auto_queue: $("followAuto").checked});
