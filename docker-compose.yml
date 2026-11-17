@@ -13,10 +13,15 @@ services:
     environment:
       OUTPUT_DIR: /downloads
       CONFIG_DIR: /config
+      STAGING_DIR: /staging
+      # POOL_STATUS_FILE: /monitor/pve-data.json
     volumes:
       # LEFT = host path (edit these). RIGHT = in-container path (leave as-is).
       - /mnt/user/media/RoosterTeeth:/downloads
       - /mnt/user/appdata/rt-grabber:/config
+      - /mnt/user/media/.rt-grabber-staging:/staging
+      # Mount an existing shared status directory after configuring the exporter.
+      # - /path/to/shared/pool-status:/monitor:ro
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/api/config')"]
       interval: 30s
