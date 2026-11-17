@@ -3,6 +3,7 @@
 import importlib.util
 import json
 import os
+import sqlite3
 import tempfile
 import time
 import unittest
@@ -375,6 +376,109 @@ class ArchiveWorkflowTests(unittest.TestCase):
         self.store.recover()
         self.assertTrue(self.store.get(fresh_id)["redownload"])
         self.assertEqual(self.store.get(fresh_id)["status"], "queued")
+
+    def test_legacy_database_migration_preserves_jobs_history_and_pause(self):
+        path = self.root / "legacy.sqlite3"
+        job = {"id": "legacy", "status": "done", "queued_at": 100, "next_attempt_at": 0,
+               "batch_id": "legacy-batch", "title": "Straße 100%_literal", "show": "Example",
+               "url": "https://archive.org/details/old", "error": "", "log": ["legacy log"],
+               "delivered_bytes": 123}
+        with sqlite3.connect(path) as db:
+            db.executescript("""
+                CREATE TABLE jobs (id TEXT PRIMARY KEY,status TEXT NOT NULL,queued_at REAL NOT NULL,
+                                   next_attempt_at REAL NOT NULL DEFAULT 0,data TEXT NOT NULL);
+                CREATE TABLE completed (destination TEXT,key TEXT,finished REAL,PRIMARY KEY(destination,key));
+                CREATE TABLE settings (key TEXT PRIMARY KEY,data TEXT NOT NULL);
+            """)
+            db.execute("INSERT INTO jobs VALUES (?,?,?,?,?)", (job["id"], job["status"], 100, 0, json.dumps(job)))
+            db.execute("INSERT INTO completed VALUES ('local:old','ia:old',100)")
+            db.execute("INSERT INTO settings VALUES ('paused','true')")
+        migrated = JobStore(path)
+        try:
+            self.assertEqual(migrated.get("legacy"), job)
+            self.assertEqual(migrated.job_page(q="STRASSE")[1], 1)
+            self.assertEqual(migrated.job_page(q="100%_literal")[1], 1)
+            self.assertEqual(migrated.summary()[1], 123)
+            self.assertEqual(migrated.batches()[0]["done"], 1)
+            self.assertEqual(migrated.history("local:old")[0], {"ia:old"})
+            self.assertTrue(migrated.setting("paused"))
+        finally:
+            migrated.close()
+
+    def test_page_decodes_only_visible_jobs_and_summaries_skip_payloads(self):
+        items = [app.DownloadItem(url=f"https://archive.org/details/roosterteeth-{i}") for i in range(150)]
+        self.store.enqueue(app.prepare_items(items))
+        with patch("state.json.loads", wraps=json.loads) as decode:
+            page, total = self.store.job_page(offset=50, limit=25)
+            self.assertEqual((len(page), total), (25, 150))
+            self.assertEqual(decode.call_count, 25)
+        with patch("state.json.loads", side_effect=AssertionError("Summary read a JSON payload")):
+            self.assertEqual(self.store.summary()[0]["queued"], 150)
+            self.assertEqual(self.store.batches()[0]["total"], 150)
+
+    def test_log_payload_is_optional_and_opened_separately(self):
+        jid = self.enqueue()
+        self.store.update(jid, log=["one line", "second line"])
+        compact = self.client.get("/api/jobs?limit=50&include_logs=false").json()["jobs"][0]
+        self.assertNotIn("log", compact)
+        self.assertTrue(compact["has_log"])
+        self.assertNotIn("target", compact)
+        self.assertEqual(self.client.get(f"/api/jobs/{jid}/logs").json()["log"], ["one line", "second line"])
+        self.assertEqual(self.client.get("/api/jobs").json()["jobs"][0]["log"], ["one line", "second line"])
+        self.assertEqual(self.client.get("/api/jobs/unknown/logs").status_code, 404)
+
+    def test_database_search_and_summaries_follow_state_changes(self):
+        first = self.enqueue()
+        second = self.enqueue(url="https://archive.org/details/other")
+        self.store.update(first, status="done", delivered_bytes=123, title="Straße 100%_literal")
+        self.store.update(second, status="error", error="temporary failure")
+        page, total = self.store.job_page(q="STRASSE", status="done", limit=1)
+        self.assertEqual(total, 1)
+        self.assertEqual(page[0]["id"], first)
+        self.assertEqual(self.store.job_page(q="100%_literal")[1], 1)
+        self.assertEqual(self.store.job_page(q="TEMPORARY FAILURE")[1], 1)
+        self.assertEqual(self.store.summary()[1], 123)
+        self.assertEqual(len(self.store.jobs_by_status(("error",))), 1)
+        self.assertEqual(self.store.jobs_by_status(()), [])
+        self.assertEqual(len(self.client.get("/api/batches?limit=1").json()["batches"]), 1)
+        self.store.remove(first)
+        self.assertEqual(self.store.job_page(q="STRASSE")[1], 0)
+        self.assertEqual(self.store.summary()[1], 0)
+
+    def test_storage_monitor_only_checks_active_jobs_and_unique_paths(self):
+        for index in range(3):
+            jid = self.enqueue(url=f"https://archive.org/details/{index}")
+            self.store.update(jid, status="running")
+        self.manager.stop_event = Mock()
+        self.manager.stop_event.wait.side_effect = [False, True]
+        with patch.object(self.store, "jobs", side_effect=AssertionError("Full history scan")), \
+             patch("downloads.storage_check", return_value={}) as check:
+            self.manager.monitor()
+        self.assertEqual(check.call_count, 2)
+        self.assertEqual({call.args[0] for call in check.call_args_list},
+                         {self.config["staging_dir"], self.config["output_dir"]})
+
+    def test_batch_notification_uses_summary_for_only_its_batch(self):
+        jid = self.enqueue()
+        job = self.store.get(jid)
+        self.store.finish(jid, [], delivered_bytes=10)
+        with patch.object(self.store, "jobs", side_effect=AssertionError("Full history scan")), \
+             patch.object(self.manager, "notify", return_value=True) as notify:
+            self.manager.notify_batch(job["batch_id"])
+            self.manager.notify_batch(job["batch_id"])
+            notify.assert_called_once()
+
+    def test_catalog_query_projects_only_episode_fields(self):
+        response = Mock()
+        response.json.return_value = []
+        with patch.object(app.requests, "post", return_value=response) as post:
+            app._run_firestore_query({"structuredQuery": {"from": [{"collectionId": "videos"}], "limit": 50}})
+        query = post.call_args.kwargs["json"]["structuredQuery"]
+        fields = {field["fieldPath"] for field in query["select"]["fields"]}
+        self.assertIn("linked_video_id", fields)
+        self.assertIn("rt_metadata.attributes", fields)
+        self.assertNotIn("rt_metadata.included", fields)
+        self.assertEqual(query["limit"], 50)
 
 
 if __name__ == "__main__":

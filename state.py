@@ -59,6 +59,23 @@ class JobStore:
             CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, data TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS subscriptions (id TEXT PRIMARY KEY, data TEXT NOT NULL);
         """)
+        # Index compact queue fields so page and summary queries can avoid
+        # decoding the JSON payload and logs for every historical job.
+        with self.transaction():
+            columns = {row[1] for row in self.db.execute("PRAGMA table_info(jobs)")}
+            for name, definition in (
+                ("batch_id", "TEXT NOT NULL DEFAULT ''"),
+                ("search_text", "TEXT NOT NULL DEFAULT ''"),
+                ("delivered_bytes", "INTEGER NOT NULL DEFAULT 0"),
+            ):
+                if name not in columns:
+                    self.db.execute(f"ALTER TABLE jobs ADD COLUMN {name} {definition}")
+            for row in self.db.execute("SELECT data FROM jobs WHERE batch_id=''").fetchall():
+                self._write(json.loads(row[0]))
+            self.db.execute("CREATE INDEX IF NOT EXISTS job_page_order ON jobs(queued_at DESC, id DESC)")
+            self.db.execute("CREATE INDEX IF NOT EXISTS batch_summary ON jobs(batch_id, status, delivered_bytes, queued_at)")
+            self.db.execute("CREATE INDEX IF NOT EXISTS job_search ON jobs(search_text, status, queued_at, id)")
+            self.db.execute("CREATE INDEX IF NOT EXISTS job_status_summary ON jobs(status, delivered_bytes)")
 
     @contextmanager
     def transaction(self):
@@ -72,11 +89,15 @@ class JobStore:
                 raise
 
     def _write(self, job):
+        search_text = " ".join(str(job.get(key) or "") for key in ("title", "show", "url", "error")).casefold()
         self.db.execute(
-            "INSERT INTO jobs VALUES (?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET "
+            "INSERT INTO jobs (id,status,queued_at,next_attempt_at,data,batch_id,search_text,delivered_bytes) "
+            "VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET "
             "status=excluded.status, queued_at=excluded.queued_at, "
-            "next_attempt_at=excluded.next_attempt_at, data=excluded.data",
-            (job["id"], job["status"], job["queued_at"], job.get("next_attempt_at", 0), json.dumps(job)),
+            "next_attempt_at=excluded.next_attempt_at, data=excluded.data, "
+            "batch_id=excluded.batch_id, search_text=excluded.search_text, delivered_bytes=excluded.delivered_bytes",
+            (job["id"], job["status"], job["queued_at"], job.get("next_attempt_at", 0), json.dumps(job),
+             job["batch_id"], search_text, job.get("delivered_bytes", 0)),
         )
 
     def get(self, job_id):
@@ -89,6 +110,62 @@ class JobStore:
             return [json.loads(row[0]) for row in self.db.execute(
                 "SELECT data FROM jobs ORDER BY queued_at DESC, id DESC"
             )]
+
+    def jobs_by_status(self, statuses):
+        if not statuses:
+            return []
+        with self.lock:
+            placeholders = ",".join("?" for _ in statuses)
+            return [json.loads(row[0]) for row in self.db.execute(
+                f"SELECT data FROM jobs WHERE status IN ({placeholders}) ORDER BY queued_at DESC, id DESC",
+                statuses,
+            )]
+
+    def job_page(self, q="", status="", offset=0, limit=None):
+        clauses, arguments = [], []
+        if status:
+            clauses.append("status=?")
+            arguments.append(status)
+        if q:
+            clauses.append("instr(search_text, ?) > 0")
+            arguments.append(q.casefold())
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        # Substring searches scan the compact search index, then fetch JSON
+        # only for IDs that belong to the requested page.
+        source = "jobs INDEXED BY job_search" if q else "jobs"
+        with self.lock:
+            total = self.db.execute("SELECT COUNT(*) FROM " + source + where, arguments).fetchone()[0]
+            selection = "SELECT id FROM " + source + where + " ORDER BY queued_at DESC, id DESC LIMIT ? OFFSET ?"
+            rows = self.db.execute(
+                "SELECT data FROM jobs WHERE id IN (" + selection + ") ORDER BY queued_at DESC, id DESC",
+                (*arguments, limit if limit is not None else -1, offset),
+            )
+            return [json.loads(row[0]) for row in rows], total
+
+    def summary(self):
+        with self.lock:
+            counts = {state: 0 for state in (*ACTIVE, *FINISHED)}
+            completed_bytes = 0
+            for row in self.db.execute("SELECT status,COUNT(*),SUM(delivered_bytes) FROM jobs GROUP BY status"):
+                counts[row[0]] = row[1]
+                if row[0] == "done":
+                    completed_bytes = row[2] or 0
+            return counts, completed_bytes
+
+    def batches(self, batch_id=None, limit=None):
+        where = " WHERE batch_id=?" if batch_id is not None else ""
+        arguments = (batch_id,) if batch_id is not None else ()
+        with self.lock:
+            rows = self.db.execute(
+                "SELECT batch_id AS id,COUNT(*) AS total,"
+                "SUM(status='done') AS done,SUM(status='error') AS error,"
+                "SUM(status='cancelled') AS cancelled,"
+                "SUM(status NOT IN ('done','error','cancelled')) AS active,"
+                "SUM(delivered_bytes) AS bytes,MAX(queued_at) AS queued_at FROM jobs"
+                + where + " GROUP BY batch_id ORDER BY queued_at DESC,id DESC LIMIT ?",
+                (*arguments, limit if limit is not None else -1),
+            )
+            return [dict(row) for row in rows]
 
     def update(self, job_id, **fields):
         with self.transaction():
