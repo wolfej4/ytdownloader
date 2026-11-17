@@ -6,10 +6,10 @@ folder layout with embedded + sidecar thumbnails.
 Run:  python app.py    then open  http://127.0.0.1:8765
 """
 
+import base64
 import json
 import logging
 import os
-import queue
 import re
 import shutil
 import subprocess
@@ -17,16 +17,21 @@ import sys
 import tempfile
 import threading
 import time
-import uuid
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import requests
 import smbclient
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+
+from downloads import DownloadManager, destination_id, smb_path, url_keys
+from state import ACTIVE, FINISHED, JobStore
 
 # --------------------------------------------------------------------------
 # Config
@@ -46,7 +51,6 @@ DEFAULT_OUTPUT = os.environ.get("OUTPUT_DIR") or str(
 
 YT_DLP = os.environ.get("YT_DLP_BIN", "yt-dlp")
 FFMPEG_BIN = os.environ.get("FFMPEG_BIN", "ffmpeg")
-SENTINEL = "@@PROG@@"
 
 # Plain stdout logging so `docker logs` / Portainer's log viewer show it.
 logging.basicConfig(
@@ -57,277 +61,97 @@ logging.basicConfig(
 log = logging.getLogger("rt-grabber")
 thumb_log = logging.getLogger("rt-grabber.thumbnails")
 
-PROGRESS_TEMPLATE = (
-    "download:" + SENTINEL
-    + "%(progress._percent_str)s|%(progress._speed_str)s|"
-    + "%(progress._eta_str)s|%(info.title)s|%(info.thumbnail)s"
-)
+DEFAULTS = {
+    "output_dir": DEFAULT_OUTPUT, "max_workers": 3,
+    "staging_dir": os.environ.get("STAGING_DIR", str(CONFIG_DIR / "staging")),
+    "min_free_gb": 5.0, "max_retries": 3, "retry_delay_seconds": 10,
+    "bandwidth_limit": "", "ntfy_url": "", "ntfy_token": "",
+    "pool_status_file": os.environ.get("POOL_STATUS_FILE", ""), "pool_max_percent": 95.0,
+}
+_config_lock = threading.RLock()
 
 
 def load_config() -> dict:
     if CONFIG_PATH.exists():
-        try:
-            return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-        except Exception:
-            pass
-    return {"output_dir": DEFAULT_OUTPUT, "max_workers": 3}
+        loaded = {**DEFAULTS, **json.loads(CONFIG_PATH.read_text(encoding="utf-8"))}
+        if loaded.get("smb", {}).get("host") and loaded["output_dir"].startswith("//"):
+            loaded["output_dir"] = DEFAULT_OUTPUT
+        return loaded
+    return dict(DEFAULTS)
 
 
 def save_config(cfg: dict) -> None:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    CONFIG_PATH.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+    # Atomic replacement preserves the previous config if writing is interrupted.
+    with tempfile.NamedTemporaryFile(mode="w", dir=CONFIG_DIR, encoding="utf-8", delete=False) as fh:
+        temporary = Path(fh.name)
+        try:
+            json.dump(cfg, fh, indent=2)
+            fh.flush()
+            os.fsync(fh.fileno())
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
+    try:
+        temporary.replace(CONFIG_PATH)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 config = load_config()
-if "max_workers" not in config:
-    config["max_workers"] = 3
+store: JobStore | None = None
+manager: DownloadManager | None = None
+
 
 # --------------------------------------------------------------------------
 # SMB  (pure-Python SMB2/3 via smbprotocol — no kernel mount needed)
 # --------------------------------------------------------------------------
-SMB_STAGE_DIR = Path("/tmp/rtgrabber-stage")
-_smb_state: dict = {}
 _smb_connected = False
 _smb_lock = threading.Lock()
 
 
-def _smb_unc(*parts: str) -> str:
-    """Return a UNC path rooted at the configured share + optional subdir."""
-    segs = [f"\\\\{_smb_state['host']}\\{_smb_state['share']}"]
-    subdir = _smb_state.get("subdir", "").strip("/\\")
-    if subdir:
-        segs.extend(subdir.replace("/", "\\").split("\\"))
-    for p in parts:
-        p = p.strip("/\\").replace("/", "\\")
-        if p and p != ".":
-            segs.extend(p.split("\\"))
-    return "\\".join(segs)
-
-
 def _smb_open_session(host: str, share: str, username: str, password: str, domain: str) -> None:
-    smbclient.reset_connection_cache()
-    kw: dict = {"username": username, "password": password}
-    if domain:
-        kw["domain"] = domain
+    account = f"{domain}\\{username}" if domain and "\\" not in username else username
+    kw: dict = {"username": account, "password": password, "connection_timeout": 15}
     smbclient.register_session(host, **kw)
     smbclient.stat(f"\\\\{host}\\{share}")  # raises if share is unreachable / auth fails
 
 
-def _copy_to_smb(local_dir: Path) -> None:
-    smbclient.makedirs(_smb_unc(), exist_ok=True)
-    for src in local_dir.rglob("*"):
-        if not src.is_file():
-            continue
-        rel = src.relative_to(local_dir)
-        if rel.parent != Path("."):
-            smbclient.makedirs(_smb_unc(str(rel.parent)), exist_ok=True)
-        with src.open("rb") as fsrc, smbclient.open_file(_smb_unc(str(rel)), mode="wb") as fdst:
-            shutil.copyfileobj(fsrc, fdst)
-
-
 def _try_auto_connect() -> None:
-    global _smb_connected, _smb_state
+    global _smb_connected
     smb = config.get("smb")
     if not smb or not smb.get("host"):
         return
     try:
         _smb_open_session(smb["host"], smb["share"], smb["username"], smb["password"], smb.get("domain", ""))
         with _smb_lock:
-            _smb_state = dict(smb)
             _smb_connected = True
     except Exception as exc:
         print(f"[SMB] Auto-connect failed: {exc}", file=sys.stderr)
 
 
-_try_auto_connect()
-
-# --------------------------------------------------------------------------
-# Job store + worker queue
-# --------------------------------------------------------------------------
-jobs: dict[str, dict] = {}
-jobs_lock = threading.Lock()
-work_queue: "queue.Queue[str]" = queue.Queue()
-
-# Tracks running subprocesses so we can cancel them
-_job_procs: dict[str, subprocess.Popen] = {}
-_job_procs_lock = threading.Lock()
-
-# Dynamic concurrency control
-_active = 0
-_active_cond = threading.Condition()
-
-ITEM_RE = re.compile(r"Downloading item (\d+) of (\d+)")
-
-_INVALID_PATH_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
-
-
-def _sanitize_pathpart(name: str) -> str:
-    cleaned = _INVALID_PATH_CHARS.sub("", name).strip().rstrip(". ")
-    return cleaned[:150] or "Untitled"
-
-
-def _build_output_template(job: dict) -> str:
-    prefix = ""
-    season, episode = job.get("season"), job.get("episode")
-    if season is not None and episode is not None:
-        prefix = f"S{int(season):02d}E{int(episode):02d} - "
-    filename = f"{prefix}%(title).200B [%(id)s].%(ext)s"
-    show = job.get("show")
-    if show:
-        return f"{_sanitize_pathpart(show)}/{filename}"
-    return filename
-
-
-def _set(job_id: str, **fields) -> None:
-    with jobs_lock:
-        if job_id in jobs:
-            jobs[job_id].update(fields)
-
-
-def run_job(job_id: str) -> None:
-    with jobs_lock:
-        job = jobs.get(job_id)
-    if not job:
-        return
-
-    # Check if cancelled before we even start
-    if job.get("status") == "cancelled":
-        return
-
-    with _smb_lock:
-        use_smb = _smb_connected
-
-    if use_smb:
-        stage_dir: Path | None = SMB_STAGE_DIR / job_id
-        stage_dir.mkdir(parents=True, exist_ok=True)
-        out_dir = str(stage_dir)
-    else:
-        stage_dir = None
-        out_dir = config["output_dir"]
-        Path(out_dir).mkdir(parents=True, exist_ok=True)
-
-    cmd = [
-        YT_DLP,
-        "--newline",
-        "--progress-template", PROGRESS_TEMPLATE,
-        "--ignore-errors",
-        "--embed-thumbnail",
-        "--convert-thumbnails", "jpg",
-        "--embed-metadata",
-        "--remux-video", "mkv",
-        "--merge-output-format", "mkv",
-        "-o", _build_output_template(job),
-        "-P", out_dir,
-        job["url"],
-    ]
-
-    _set(job_id, status="running", started=time.time())
-    tail: list[str] = []
+@asynccontextmanager
+async def lifespan(app):
+    global store, manager
+    store = JobStore(CONFIG_DIR / "state.sqlite3")
+    manager = DownloadManager(store, config)
+    if not config.get("smb", {}).get("host"):
+        store.import_archive(Path(config["output_dir"]) / ".downloaded.txt", destination_id(current_target()))
+    _try_auto_connect()
+    manager.start()
+    follow_thread = threading.Thread(target=follow_worker, name="show-follows", daemon=True)
+    follow_thread.start()
     try:
-        proc = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, bufsize=1, encoding="utf-8", errors="replace",
-        )
-    except FileNotFoundError:
-        _set(job_id, status="error",
-             error=f"Could not find '{YT_DLP}'. Install it and make sure it's on PATH.")
-        return
-
-    with _job_procs_lock:
-        _job_procs[job_id] = proc
-
-    try:
-        for line in proc.stdout:  # type: ignore[union-attr]
-            line = line.rstrip("\n")
-            if not line:
-                continue
-            tail.append(line)
-            del tail[:-12]  # keep last 12 lines for error reporting
-
-            if line.startswith(SENTINEL):
-                parts = line[len(SENTINEL):].split("|")
-                pct = (parts[0] if len(parts) > 0 else "").strip()
-                speed = (parts[1] if len(parts) > 1 else "").strip()
-                eta = (parts[2] if len(parts) > 2 else "").strip()
-                title = (parts[3] if len(parts) > 3 else "").strip()
-                thumb = (parts[4] if len(parts) > 4 else "").strip()
-                num = None
-                try:
-                    num = float(pct.replace("%", ""))
-                except ValueError:
-                    pass
-                updates: dict = dict(percent=num, percent_str=pct, speed=speed,
-                                     eta=eta, title=title or job.get("title"))
-                if thumb and thumb != "NA":
-                    updates["thumbnail_url"] = thumb
-                _set(job_id, **updates)
-            else:
-                m = ITEM_RE.search(line)
-                if m:
-                    _set(job_id, current=int(m.group(1)), total=int(m.group(2)))
+        yield
     finally:
-        with _job_procs_lock:
-            _job_procs.pop(job_id, None)
-
-    proc.wait()
-
-    # Check if cancelled mid-run
-    with jobs_lock:
-        current_status = jobs.get(job_id, {}).get("status")
-    if current_status == "cancelled":
-        if stage_dir:
-            shutil.rmtree(stage_dir, ignore_errors=True)
-        return
-
-    if proc.returncode == 0:
-        if use_smb and stage_dir:
-            _set(job_id, status="uploading", percent=100.0, percent_str="100%")
-            try:
-                _copy_to_smb(stage_dir)
-                _set(job_id, status="done", finished=time.time())
-            except Exception as exc:
-                _set(job_id, status="error", finished=time.time(),
-                     error=f"SMB upload failed: {exc}")
-            finally:
-                shutil.rmtree(stage_dir, ignore_errors=True)
-        else:
-            _set(job_id, status="done", percent=100.0, percent_str="100%",
-                 finished=time.time())
-    else:
-        _set(job_id, status="error", finished=time.time(),
-             error="\n".join(tail[-6:]) or f"yt-dlp exited with code {proc.returncode}")
-        if stage_dir:
-            shutil.rmtree(stage_dir, ignore_errors=True)
+        manager.stop()
+        follow_thread.join(timeout=25)
+        # Daemon workers may still be returning from network timeouts. Their
+        # transactions finish against the connection before process exit.
 
 
-def worker() -> None:
-    global _active
-    while True:
-        job_id = work_queue.get()
-        # Wait until we're under the concurrency limit
-        with _active_cond:
-            while _active >= config.get("max_workers", 3):
-                _active_cond.wait()
-            _active += 1
-        try:
-            run_job(job_id)
-        except Exception as exc:  # noqa: BLE001
-            _set(job_id, status="error", error=str(exc))
-        finally:
-            with _active_cond:
-                _active -= 1
-                _active_cond.notify_all()
-            work_queue.task_done()
+app = FastAPI(title="RT Grabber", lifespan=lifespan)
 
-
-_POOL_SIZE = 20  # large enough that the concurrency limit is always the bottleneck
-for _ in range(_POOL_SIZE):
-    threading.Thread(target=worker, daemon=True).start()
-
-# --------------------------------------------------------------------------
-# API
-# --------------------------------------------------------------------------
-app = FastAPI(title="RT Grabber")
 
 # --------------------------------------------------------------------------
 # RT Archive browsing (reads the same public Firestore backend the
@@ -343,6 +167,8 @@ SHOWS_TTL = 3600.0
 def _fs_val(v: dict):
     if "stringValue" in v:
         return v["stringValue"]
+    if "timestampValue" in v:
+        return v["timestampValue"]
     if "integerValue" in v:
         return int(v["integerValue"])
     if "doubleValue" in v:
@@ -446,35 +272,79 @@ def browse_shows(q: str = "") -> dict:
     return {"shows": results[:200]}
 
 
+def _encode_cursor(data):
+    return base64.urlsafe_b64encode(json.dumps(data).encode()).decode()
+
+
+def _decode_cursor(value, scope):
+    if not value:
+        return None
+    try:
+        data = json.loads(base64.b64decode(value, altchars=b"-_", validate=True))
+        if data["scope"] != scope or len(value) > 12000:
+            raise ValueError("Cursor does not match this search")
+        return data
+    except (KeyError, TypeError, ValueError) as exc:
+        raise HTTPException(400, "Invalid catalog cursor") from exc
+
+
+def _catalog_page(show_id, cursor="", limit=500):
+    scope = "show:" + show_id
+    decoded = _decode_cursor(cursor, scope)
+    query = {
+        "from": [{"collectionId": "videos"}],
+        "where": {"fieldFilter": {"field": {"fieldPath": "shows"},
+                  "op": "ARRAY_CONTAINS", "value": {"stringValue": show_id}}},
+        "orderBy": [{"field": {"fieldPath": "__name__"}, "direction": "ASCENDING"}],
+        "limit": limit,
+    }
+    if decoded:
+        query["startAt"] = {"values": [{"referenceValue": f"{FIRESTORE_URL.removeprefix('https://firestore.googleapis.com/v1/')}/videos/{decoded['id']}"}], "before": False}
+    docs = _run_firestore_query({"structuredQuery": query})
+    next_cursor = _encode_cursor({"scope": scope, "id": docs[-1]["id"]}) if len(docs) == limit else None
+    return docs, next_cursor
+
+
+def _merge_episodes(episodes):
+    results, by_key = [], {}
+    for episode in episodes:
+        existing = next((by_key[key] for key in episode["keys"] if key in by_key), None)
+        if existing is None:
+            results.append(episode)
+            existing = episode
+        else:
+            for field in ("rt_url", "youtube_url", "description", "show", "season", "episode_number"):
+                if existing.get(field) is None or existing.get(field) == "":
+                    existing[field] = episode.get(field)
+            existing["keys"] = list(dict.fromkeys(existing["keys"] + episode["keys"]))
+        for key in existing["keys"]:
+            by_key[key] = existing
+    return results
+
+
+def _episode_history(episodes):
+    done, pending = store.history(destination_id(current_target()))
+    for episode in episodes:
+        episode["download_status"] = "downloaded" if done.intersection(episode["keys"]) else "queued" if pending.intersection(episode["keys"]) else "missing"
+    return episodes
+
+
 @app.get("/api/browse/shows/{show_id}/episodes")
-def browse_episodes(show_id: str) -> dict:
+def browse_episodes(show_id: str, cursor: str = "", limit: int = Query(5000, ge=1, le=5000)) -> dict:
     fallback_title = show_id
     try:
-        fallback_title = next(
-            (s.get("title") for s in get_shows() if s["id"] == show_id), show_id
-        )
-    except Exception:
-        pass
-
-    body = {
-        "structuredQuery": {
-            "from": [{"collectionId": "videos"}],
-            "where": {"fieldFilter": {
-                "field": {"fieldPath": "shows"},
-                "op": "ARRAY_CONTAINS",
-                "value": {"stringValue": show_id},
-            }},
-            "limit": 5000,
-        }
-    }
-    try:
-        docs = _run_firestore_query(body)
+        docs, next_cursor = _catalog_page(show_id, cursor, limit)
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(502, f"Couldn't reach RT Archive: {exc}")
-
-    episodes = [_shape_episode(d, fallback_show=fallback_title) for d in docs]
+    try:
+        fallback_title = next((s.get("title") for s in get_shows() if s["id"] == show_id), show_id)
+    except Exception:
+        pass
+    episodes = _merge_episodes([_shape_episode(d, fallback_show=fallback_title) for d in docs])
     episodes.sort(key=lambda e: e["date"])
-    return {"episodes": episodes}
+    return {"episodes": _episode_history(episodes), "next_cursor": next_cursor}
 
 
 def _shape_episode(d: dict, fallback_show: str | None = None) -> dict:
@@ -499,8 +369,11 @@ def _shape_episode(d: dict, fallback_show: str | None = None) -> dict:
 
     return {
         "id": d["id"],
+        "keys": list(dict.fromkeys(key for u in (rt_url, youtube_url) if u for key in url_keys(u))) or ["catalog:" + d["id"]],
+        "description": attrs.get("description") or d.get("description") or "",
+        "release_date": _release_date(d.get("sort_date") or d.get("date")),
         "title": d.get("title") or d["id"],
-        "date": d.get("sort_date") or d.get("date") or 0,
+        "date": _date_number(d.get("sort_date") or d.get("date")),
         "duration": d.get("duration"),
         "rt_url": rt_url,
         "youtube_url": youtube_url,
@@ -511,54 +384,61 @@ def _shape_episode(d: dict, fallback_show: str | None = None) -> dict:
     }
 
 
+def _date_number(value):
+    try:
+        number = float(value)
+        return number / 1000 if number > 100000000000 else number
+    except (ValueError, TypeError):
+        try:
+            return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return 0
+
+
+def _release_date(value):
+    stamp = _date_number(value)
+    try:
+        return datetime.fromtimestamp(stamp, timezone.utc).strftime("%Y-%m-%d") if stamp else ""
+    except (ValueError, OverflowError, OSError):
+        return ""
+
+
 @app.get("/api/browse/episodes")
-def browse_episode_search(q: str = "") -> dict:
+def browse_episode_search(q: str = "", cursor: str = "", limit: int = Query(100, ge=1, le=500)) -> dict:
     query = q.strip()
     if not query:
-        return {"episodes": []}
-
-    # Firestore only supports "starts with" prefix range queries on a field —
-    # no substring/full-text search — and string comparison is case-sensitive,
-    # so try a few common casings (rtarchive.org titles are a mix of ALL CAPS
-    # and Title Case) and merge the results.
-    variants = {query, query.upper(), query.title()}
-    docs_by_id: dict[str, dict] = {}
+        return {"episodes": [], "next_cursor": None}
+    variants = sorted({query, query.upper(), query.title()})
+    scope = "title:" + query
+    positions = (_decode_cursor(cursor, scope) or {}).get("positions", {})
+    episodes = []
     try:
         for variant in variants:
-            body = {
-                "structuredQuery": {
-                    "from": [{"collectionId": "videos"}],
-                    "where": {"compositeFilter": {"op": "AND", "filters": [
-                        {"fieldFilter": {
-                            "field": {"fieldPath": "title"},
-                            "op": "GREATER_THAN_OR_EQUAL",
-                            "value": {"stringValue": variant},
-                        }},
-                        {"fieldFilter": {
-                            "field": {"fieldPath": "title"},
-                            "op": "LESS_THAN",
-                            "value": {"stringValue": variant + ""},
-                        }},
-                    ]}},
-                    "limit": 40,
-                }
+            if positions.get(variant) is False:
+                continue
+            structured = {
+                "from": [{"collectionId": "videos"}],
+                "where": {"compositeFilter": {"op": "AND", "filters": [
+                    {"fieldFilter": {"field": {"fieldPath": "title"}, "op": "GREATER_THAN_OR_EQUAL", "value": {"stringValue": variant}}},
+                    {"fieldFilter": {"field": {"fieldPath": "title"}, "op": "LESS_THAN", "value": {"stringValue": variant + "\uf8ff"}}},
+                ]}},
+                "orderBy": [{"field": {"fieldPath": "title"}, "direction": "ASCENDING"},
+                            {"field": {"fieldPath": "__name__"}, "direction": "ASCENDING"}],
+                "limit": limit,
             }
-            for d in _run_firestore_query(body):
-                docs_by_id[d["id"]] = d
+            position = positions.get(variant)
+            if position:
+                structured["startAt"] = {"values": [{"stringValue": position["title"]},
+                    {"referenceValue": f"{FIRESTORE_URL.removeprefix('https://firestore.googleapis.com/v1/')}/videos/{position['id']}"}], "before": False}
+            docs = _run_firestore_query({"structuredQuery": structured})
+            positions[variant] = {"id": docs[-1]["id"], "title": docs[-1]["title"]} if len(docs) == limit else False
+            episodes.extend(_shape_episode(d) for d in docs)
     except Exception as exc:
         raise HTTPException(502, f"Couldn't reach RT Archive: {exc}")
-
-    episodes = []
-    for d in docs_by_id.values():
-        # Skip a YouTube-side doc when it's just the mirror of an RT-sourced
-        # episode — that canonical doc will surface on its own and carries
-        # richer metadata (show/season/episode number).
-        if d.get("platform") == "youtube" and d.get("linked_video_platform") == "roosterteeth":
-            continue
-        episodes.append(_shape_episode(d))
-
-    episodes.sort(key=lambda e: (e["title"] or "").lower())
-    return {"episodes": episodes[:100]}
+    episodes = _merge_episodes(episodes)
+    episodes.sort(key=lambda e: e["title"].lower())
+    next_cursor = _encode_cursor({"scope": scope, "positions": positions}) if any(positions.values()) else None
+    return {"episodes": _episode_history(episodes), "next_cursor": next_cursor}
 
 
 # --------------------------------------------------------------------------
@@ -629,7 +509,8 @@ def _select_ia_thumbnail_file(files: list[dict]) -> dict | None:
 def _image_to_jpg(data: bytes, source_name: str) -> bytes | None:
     if source_name.lower().endswith((".jpg", ".jpeg")):
         return data
-    with tempfile.TemporaryDirectory() as td:
+    Path(config["staging_dir"]).mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=config["staging_dir"]) as td:
         src = Path(td) / f"in{Path(source_name).suffix or '.img'}"
         dst = Path(td) / "out.jpg"
         src.write_bytes(data)
@@ -725,18 +606,19 @@ def _fwrite_bytes(kind: str, dirpath: str, filename: str, data: bytes) -> None:
         (Path(dirpath) / filename).write_bytes(data)
 
 
-def _iter_video_files():
+def _iter_video_files(target=None):
     """Yield (kind, dirpath, filename, root) for every video in the active storage location."""
-    with _smb_lock:
-        use_smb = _smb_connected
-    if use_smb:
-        root = _smb_unc()
+    target = target or current_target()
+    if target["kind"] == "smb":
+        _smb_open_session(target["host"], target["share"], target.get("username", ""),
+                          target.get("password", ""), target.get("domain", ""))
+        root = smb_path(target)
         for dirpath, _dirs, files in smbclient.walk(root):
             for fn in files:
                 if fn.lower().endswith(VIDEO_EXTS):
                     yield "smb", dirpath, fn, root
     else:
-        root = config["output_dir"]
+        root = target["path"]
         root_path = Path(root)
         if not root_path.exists():
             return
@@ -751,7 +633,8 @@ def _show_folder_name(kind: str, dirpath: str, root: str) -> str | None:
     if dirpath_norm == root_norm:
         return None
     sep = "\\" if kind == "smb" else os.sep
-    return dirpath_norm.replace("/", sep).rsplit(sep, 1)[-1]
+    relative = dirpath_norm[len(root_norm):].strip("/\\")
+    return relative.replace("/", sep).split(sep)[0]
 
 
 def _run_thumbnail_scan() -> None:
@@ -802,17 +685,18 @@ def _run_thumbnail_scan() -> None:
                     with _thumb_scan_lock:
                         _thumb_scan_state["errors"] += 1
 
-            folder_key = (kind, dirpath)
+            show_name = _show_folder_name(kind, dirpath, root)
+            art_dir = root.rstrip("/\\") + ("\\" if kind == "smb" else os.sep) + show_name if show_name else dirpath
+            folder_key = (kind, art_dir)
             if folder_key not in seen_folders:
                 seen_folders.add(folder_key)
-                show_name = _show_folder_name(kind, dirpath, root)
-                if show_name and not _fpath_exists(kind, dirpath, "folder.jpg"):
+                if show_name and not _fpath_exists(kind, art_dir, "folder.jpg"):
                     thumb_log.info("fetching show art for folder %r", show_name)
                     poster = _lookup_show_poster(show_name)
                     if poster:
                         try:
-                            _fwrite_bytes(kind, dirpath, "folder.jpg", poster)
-                            thumb_log.info("wrote %s/folder.jpg (%d bytes)", dirpath, len(poster))
+                            _fwrite_bytes(kind, art_dir, "folder.jpg", poster)
+                            thumb_log.info("wrote %s/folder.jpg (%d bytes)", art_dir, len(poster))
                             with _thumb_scan_lock:
                                 _thumb_scan_state["added"] += 1
                         except Exception as exc:
@@ -850,171 +734,400 @@ def get_thumbnail_scan_status() -> dict:
 class DownloadItem(BaseModel):
     url: str
     show: str | None = None
-    season: int | None = None
-    episode: int | None = None
+    season: int | None = Field(None, ge=0)
+    episode: int | None = Field(None, ge=0)
+    title: str = ""
+    description: str = ""
+    release_date: str = ""
+    keys: list[str] = Field(default_factory=list, max_length=10)
 
 
 class DownloadRequest(BaseModel):
-    urls: list[str] = []
-    items: list[DownloadItem] = []
+    urls: list[str] = Field(default_factory=list)
+    items: list[DownloadItem] = Field(default_factory=list)
 
 
 class ConfigRequest(BaseModel):
-    output_dir: str
+    output_dir: str | None = None
+    staging_dir: str | None = None
+    min_free_gb: float | None = Field(None, ge=0, le=100000)
+    max_retries: int | None = Field(None, ge=0, le=10)
+    retry_delay_seconds: int | None = Field(None, ge=1, le=300)
+    bandwidth_limit: str | None = None
+    ntfy_url: str | None = None
+    ntfy_token: str | None = None
+    pool_status_file: str | None = None
+    pool_max_percent: float | None = Field(None, ge=50, le=99.9)
 
 
 class WorkersRequest(BaseModel):
     max_workers: int
 
 
+def current_target():
+    with _config_lock:
+        smb = config.get("smb", {})
+        if smb.get("host"):
+            return {"kind": "smb", **smb}
+        return {"kind": "local", "path": config["output_dir"]}
+
+
+def prepare_items(items):
+    target = current_target()
+    destination = destination_id(target)
+    prepared = []
+    for item in items:
+        data = item.model_dump()
+        url = data["url"].strip()
+        parsed = urlsplit(url)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            raise HTTPException(400, "Download URLs must use http or https")
+        if parsed.username or parsed.password:
+            raise HTTPException(400, "Use a URL without embedded credentials")
+        data.update(url=url, keys=list(dict.fromkeys([*url_keys(url), *data["keys"]])),
+                    target=target, destination=destination, staging_root=config["staging_dir"])
+        prepared.append(data)
+    return prepared
+
+
 @app.get("/api/config")
 def get_config() -> dict:
-    with _smb_lock:
-        connected = _smb_connected
+    result = {key: value for key, value in config.items() if key not in ("smb", "ntfy_token")}
     smb = config.get("smb", {})
-    return {
-        "output_dir": config["output_dir"],
-        "max_workers": config.get("max_workers", 3),
-        "yt_dlp_ok": shutil.which(YT_DLP) is not None,
-        "ffmpeg_ok": shutil.which("ffmpeg") is not None,
-        "smb_connected": connected,
-        "smb": {
-            "host": smb.get("host", ""),
-            "share": smb.get("share", ""),
-            "username": smb.get("username", ""),
-            "password": smb.get("password", ""),
-            "domain": smb.get("domain", ""),
-            "subdir": smb.get("subdir", ""),
-        },
-    }
+    result.update(yt_dlp_ok=shutil.which(YT_DLP) is not None, ffmpeg_ok=shutil.which(FFMPEG_BIN) is not None,
+                  smb_connected=_smb_connected, ntfy_token_set=bool(config.get("ntfy_token")),
+                  smb={key: value for key, value in smb.items() if key != "password"})
+    return result
 
 
 @app.post("/api/config")
 def set_config(req: ConfigRequest) -> dict:
-    path = req.output_dir.strip()
-    if not path:
-        raise HTTPException(400, "Output folder cannot be empty.")
-    try:
-        Path(path).mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        raise HTTPException(400, f"Can't use that folder: {exc}")
-    config["output_dir"] = path
-    save_config(config)
-    return {"output_dir": path}
+    updates = req.model_dump(exclude_none=True)
+    for field in ("output_dir", "staging_dir"):
+        if field in updates:
+            path = updates[field].strip()
+            if not path:
+                raise HTTPException(400, f"{field} cannot be empty")
+            try:
+                Path(path).mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                raise HTTPException(400, f"Cannot use {field}: {exc}") from exc
+            updates[field] = str(Path(path).resolve())
+    if "bandwidth_limit" in updates:
+        updates["bandwidth_limit"] = updates["bandwidth_limit"].strip()
+        if updates["bandwidth_limit"] and not re.fullmatch(r"\d+(?:\.\d+)?[KMGkmg]?", updates["bandwidth_limit"]):
+            raise HTTPException(400, "Use a bandwidth limit such as 5M, 500K, or leave blank")
+    if updates.get("ntfy_url"):
+        parsed = urlsplit(updates["ntfy_url"])
+        if parsed.scheme not in ("http", "https") or not parsed.hostname or not parsed.path.strip("/"):
+            raise HTTPException(400, "Enter a full ntfy topic URL such as https://ntfy.example.com/rt-grabber")
+    with _config_lock:
+        save_config({**config, **updates})
+        config.update(updates)
+    return get_config()
 
 
 @app.post("/api/workers")
 def set_workers(req: WorkersRequest) -> dict:
-    n = max(1, min(20, req.max_workers))
-    config["max_workers"] = n
-    save_config(config)
-    with _active_cond:
-        _active_cond.notify_all()
-    return {"max_workers": n}
+    number = max(1, min(20, req.max_workers))
+    with _config_lock:
+        save_config({**config, "max_workers": number})
+        config["max_workers"] = number
+    manager.wake.set()
+    return {"max_workers": number}
 
 
 @app.post("/api/download")
 def submit(req: DownloadRequest) -> dict:
-    items = list(req.items) + [DownloadItem(url=u) for u in req.urls if u.strip()]
-    items = [it for it in items if it.url.strip()]
+    items = list(req.items) + [DownloadItem(url=url) for url in req.urls if url.strip()]
+    items = [item for item in items if item.url.strip()]
     if not items:
-        raise HTTPException(400, "No URLs provided.")
-    created = []
-    for item in items:
-        job_id = uuid.uuid4().hex
-        with jobs_lock:
-            jobs[job_id] = {
-                "id": job_id, "url": item.url.strip(), "status": "queued",
-                "show": item.show, "season": item.season, "episode": item.episode,
-                "percent": 0.0, "percent_str": "", "speed": "", "eta": "",
-                "title": "", "thumbnail_url": "", "current": None, "total": None,
-                "error": "", "queued_at": time.time(),
-            }
-        work_queue.put(job_id)
-        created.append(job_id)
-    return {"created": created}
+        raise HTTPException(400, "No URLs provided")
+    prepared = prepare_items(items)
+    result = store.enqueue(prepared)
+    manager.wake.set()
+    return result
+
+
+def public_job(job):
+    return {key: value for key, value in job.items() if key not in ("target",)}
 
 
 @app.get("/api/jobs")
-def list_jobs() -> dict:
-    with jobs_lock:
-        items = sorted(jobs.values(), key=lambda j: j["queued_at"], reverse=True)
-    return {"jobs": items}
+def list_jobs(q: str = "", status: str = "", offset: int = Query(0, ge=0),
+              limit: int | None = Query(None, ge=1, le=5000)) -> dict:
+    all_jobs = store.jobs()
+    counts = {state: 0 for state in (*ACTIVE, *FINISHED)}
+    for job in all_jobs:
+        counts[job["status"]] += 1
+    filtered = [job for job in all_jobs if (not status or job["status"] == status)
+                and q.casefold() in " ".join(str(job.get(key) or "") for key in ("title", "show", "url", "error")).casefold()]
+    page = filtered[offset:offset + limit] if limit else filtered[offset:]
+    return {"jobs": [public_job(job) for job in page], "total": len(filtered), "counts": counts,
+            "completed_bytes": sum(j.get("delivered_bytes", 0) for j in all_jobs if j["status"] == "done"),
+            "paused": manager.runtime_paused or store.setting("paused", False),
+            "pause_reason": manager.storage_error or store.setting("pause_reason", ""),
+            "notification_error": manager.last_notification_error}
+
+
+@app.get("/api/batches")
+def list_batches():
+    batches = {}
+    for job in store.jobs():
+        batch = batches.setdefault(job["batch_id"], {"id": job["batch_id"], "total": 0, "done": 0,
+                  "error": 0, "cancelled": 0, "active": 0, "bytes": 0, "queued_at": job["queued_at"]})
+        batch["total"] += 1
+        batch[job["status"] if job["status"] in FINISHED else "active"] += 1
+        batch["bytes"] += job.get("delivered_bytes", 0)
+    return {"batches": list(batches.values())}
+
+
+@app.post("/api/queue/pause")
+def pause_queue():
+    manager.pause()
+    return {"paused": True}
+
+
+@app.post("/api/queue/resume")
+def resume_queue():
+    try:
+        manager.resume()
+    except OSError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {"paused": False}
+
+
+@app.get("/api/storage")
+def get_storage():
+    try:
+        return {"locations": manager.check_storage(), "error": ""}
+    except OSError as exc:
+        return {"locations": [], "error": str(exc)}
+
+
+@app.post("/api/notifications/test")
+def test_notification():
+    if not config.get("ntfy_url"):
+        raise HTTPException(400, "Save an ntfy topic URL first")
+    if not manager.notify("RT Grabber", "Test notification from RT Grabber"):
+        raise HTTPException(502, manager.last_notification_error)
+    return {"sent": True}
+
+
+def _job(job_id):
+    job = store.get(job_id)
+    if job is None:
+        raise HTTPException(404, "Job not found")
+    return job
+
+
+def _remove_job(job):
+    with manager.process_lock:
+        if job["id"] in manager.in_flight:
+            raise HTTPException(409, "The worker is still stopping. Try again shortly")
+        job = _job(job["id"])
+        if job["status"] not in FINISHED:
+            raise HTTPException(400, "Cancel the download before removing it")
+        shutil.rmtree(Path(job["staging_root"]) / job["id"], ignore_errors=True)
+        store.remove(job["id"])
 
 
 @app.post("/api/jobs/clear")
 def clear_finished() -> dict:
-    with jobs_lock:
-        for jid in [j["id"] for j in jobs.values() if j["status"] in ("done", "error", "cancelled")]:
-            del jobs[jid]
+    for job in store.jobs():
+        if job["status"] in FINISHED:
+            _remove_job(job)
     return {"ok": True}
 
 
 @app.post("/api/jobs/clear/done")
 def clear_done() -> dict:
-    with jobs_lock:
-        for jid in [j["id"] for j in jobs.values() if j["status"] == "done"]:
-            del jobs[jid]
+    for job in store.jobs():
+        if job["status"] == "done":
+            _remove_job(job)
     return {"ok": True}
 
 
 @app.post("/api/jobs/{job_id}/cancel")
 def cancel_job(job_id: str) -> dict:
-    with jobs_lock:
-        job = jobs.get(job_id)
-    if not job:
-        raise HTTPException(404, "Job not found.")
-    if job["status"] in ("done", "error", "cancelled"):
-        raise HTTPException(400, "Job is already finished.")
-    _set(job_id, status="cancelled", finished=time.time())
-    with _job_procs_lock:
-        proc = _job_procs.get(job_id)
-    if proc:
-        try:
+    job = _job(job_id)
+    if job["status"] in FINISHED:
+        raise HTTPException(400, "Job is already finished")
+    if not store.transition(job_id, ACTIVE, "cancelled", finished=time.time()):
+        raise HTTPException(409, "Job has already finished")
+    with manager.process_lock:
+        proc = manager.processes.get(job_id)
+        if proc and proc.poll() is None:
             proc.terminate()
-        except Exception:
-            pass
     return {"cancelled": True}
 
 
-def _retry_job(job_id: str) -> None:
-    _set(job_id,
-         status="queued", percent=0.0, percent_str="", speed="", eta="",
-         error="", current=None, total=None, thumbnail_url="", queued_at=time.time())
-    work_queue.put(job_id)
+def _retry_job(job_id):
+    job = _job(job_id)
+    if job["status"] not in ("error", "cancelled"):
+        raise HTTPException(400, "Only errored or cancelled jobs can be retried")
+    with manager.process_lock:
+        if job_id in manager.in_flight:
+            raise HTTPException(409, "The worker is still stopping. Try again shortly")
+        if not store.transition(job_id, ("error", "cancelled"), "queued", attempts=0, next_attempt_at=0, error="", queued_at=time.time()):
+            raise HTTPException(409, "Job state changed. Refresh and try again")
+    manager.wake.set()
 
 
 @app.post("/api/jobs/{job_id}/retry")
 def retry_job(job_id: str) -> dict:
-    with jobs_lock:
-        job = jobs.get(job_id)
-    if not job:
-        raise HTTPException(404, "Job not found.")
-    if job["status"] not in ("error", "cancelled"):
-        raise HTTPException(400, "Only errored or cancelled jobs can be retried.")
     _retry_job(job_id)
     return {"retried": True}
 
 
 @app.post("/api/jobs/retry/failed")
 def retry_failed_jobs() -> dict:
-    with jobs_lock:
-        job_ids = [j["id"] for j in jobs.values() if j["status"] == "error"]
-    for job_id in job_ids:
-        _retry_job(job_id)
-    return {"retried": len(job_ids)}
+    failed = [job for job in store.jobs() if job["status"] == "error"]
+    for job in failed:
+        _retry_job(job["id"])
+    return {"retried": len(failed)}
 
 
 @app.delete("/api/jobs/{job_id}")
 def remove_job(job_id: str) -> dict:
-    with jobs_lock:
-        job = jobs.get(job_id)
-        if not job:
-            raise HTTPException(404, "Job not found.")
-        if job["status"] not in ("done", "error", "cancelled"):
-            raise HTTPException(400, "Cancel the download before removing it.")
-        del jobs[job_id]
+    _remove_job(_job(job_id))
     return {"removed": True}
+
+
+_follow_lock = threading.Lock()
+
+
+class FollowRequest(BaseModel):
+    show_id: str = Field(min_length=1, max_length=250)
+    title: str = ""
+    preference: str = "roosterteeth"
+    interval_hours: float = Field(6, ge=0.25, le=720)
+    auto_queue: bool = False
+
+
+@app.get("/api/follows")
+def list_follows():
+    return {"follows": [{key: value for key, value in follow.items() if key != "known_keys"}
+                        for follow in store.subscriptions()]}
+
+
+@app.post("/api/follows")
+def follow_show(req: FollowRequest):
+    if req.preference not in ("roosterteeth", "youtube"):
+        raise HTTPException(400, "Choose Website or YouTube")
+    with _follow_lock:
+        previous = next((f for f in store.subscriptions() if f["id"] == req.show_id), {})
+        follow = {**previous, **req.model_dump(), "id": req.show_id, "next_check": 0,
+                  "known_keys": previous.get("known_keys"), "error": ""}
+        store.save_subscription(follow)
+    return {"followed": True}
+
+
+@app.delete("/api/follows/{show_id}")
+def unfollow_show(show_id: str):
+    with _follow_lock:
+        store.remove_subscription(show_id)
+    return {"removed": True}
+
+
+def check_follows(force=False):
+    if not _follow_lock.acquire(blocking=False):
+        return
+    try:
+        for follow in store.subscriptions():
+            if not force and follow.get("next_check", 0) > time.time():
+                continue
+            if manager.stop_event.is_set():
+                return
+            try:
+                episodes, cursor = [], ""
+                while True:
+                    docs, cursor = _catalog_page(follow["id"], cursor, 500)
+                    episodes.extend(_shape_episode(d, follow["title"]) for d in docs)
+                    if not cursor or manager.stop_event.is_set():
+                        break
+                if manager.stop_event.is_set():
+                    return
+                episodes = _merge_episodes(episodes)
+                archived = [ep for ep in episodes if ep["rt_url"] or ep["youtube_url"]]
+                known = set(follow.get("known_keys") or [])
+                fresh = [ep for ep in archived if not known.intersection(ep["keys"])] if follow.get("known_keys") is not None else []
+                if fresh and follow["auto_queue"]:
+                    items = []
+                    for ep in fresh:
+                        preferred = ep["youtube_url"] if follow["preference"] == "youtube" else ep["rt_url"]
+                        items.append(DownloadItem(url=preferred or ep["rt_url"] or ep["youtube_url"],
+                            show=ep["show"], season=ep["season"], episode=ep["episode_number"],
+                            title=ep["title"], description=ep["description"], release_date=ep["release_date"], keys=ep["keys"]))
+                    store.enqueue(prepare_items(items))
+                    manager.wake.set()
+                for ep in archived:
+                    known.update(ep["keys"])
+                if fresh:
+                    manager.notify("New archived episodes", f"{follow['title'] or follow['id']}: {len(fresh)} new episodes" + (" queued" if follow["auto_queue"] else " available"))
+                follow.update(known_keys=sorted(known), last_check=time.time(), new_count=len(fresh), error="")
+            except Exception as exc:
+                follow["error"] = str(exc)[-1000:]
+                log.warning("Follow check failed for %s: %s", follow["id"], exc)
+            follow["next_check"] = time.time() + follow["interval_hours"] * 3600
+            store.save_subscription(follow)
+    finally:
+        _follow_lock.release()
+
+
+def follow_worker():
+    while not manager.stop_event.is_set():
+        try:
+            check_follows()
+        except Exception:
+            log.exception("Could not save followed show state")
+        manager.stop_event.wait(30)
+
+
+@app.post("/api/follows/check")
+def check_followed_shows():
+    threading.Thread(target=check_follows, kwargs={"force": True}, daemon=True).start()
+    return {"started": True}
+
+
+_library_state = {"running": False, "checked": 0, "recorded": 0, "error": ""}
+_library_lock = threading.Lock()
+
+
+def _scan_library():
+    target = current_target()
+    destination = destination_id(target)
+    try:
+        for kind, dirpath, filename, _root in _iter_video_files(target):
+            video_id = _bracket_id(filename)
+            with _library_lock:
+                _library_state["checked"] += 1
+            if video_id and _IA_ID_RE.match(video_id):
+                store.record_existing(destination, url_keys("https://archive.org/details/" + video_id))
+                with _library_lock:
+                    _library_state["recorded"] += 1
+    except Exception as exc:
+        with _library_lock:
+            _library_state["error"] = str(exc)
+    finally:
+        with _library_lock:
+            _library_state["running"] = False
+
+
+@app.post("/api/library/scan")
+def scan_library():
+    with _library_lock:
+        if _library_state["running"]:
+            raise HTTPException(409, "A library scan is already running")
+        _library_state.update(running=True, checked=0, recorded=0, error="")
+    threading.Thread(target=_scan_library, daemon=True).start()
+    return {"started": True}
+
+
+@app.get("/api/library/scan")
+def library_scan_status():
+    with _library_lock:
+        return dict(_library_state)
 
 
 class SmbConnectRequest(BaseModel):
@@ -1028,7 +1141,7 @@ class SmbConnectRequest(BaseModel):
 
 @app.post("/api/smb/connect")
 def smb_connect(req: SmbConnectRequest) -> dict:
-    global _smb_connected, _smb_state
+    global _smb_connected
     host = req.host.strip()
     share = req.share.strip()
     if not host or not share:
@@ -1038,28 +1151,27 @@ def smb_connect(req: SmbConnectRequest) -> dict:
     except Exception as exc:
         raise HTTPException(400, f"Connection failed: {exc}")
     subdir = req.subdir.strip().strip("/\\")
+    smb = {"host": host, "share": share, "username": req.username,
+           "password": req.password, "domain": req.domain, "subdir": subdir}
+    with _config_lock:
+        updated = {**config, "smb": smb}
+        save_config(updated)
+        config.update(updated)
     with _smb_lock:
-        _smb_state = {
-            "host": host, "share": share, "username": req.username,
-            "password": req.password, "domain": req.domain, "subdir": subdir,
-        }
         _smb_connected = True
-    config["smb"] = dict(_smb_state)
-    config["output_dir"] = f"//{host}/{share}/{subdir}".rstrip("/")
-    save_config(config)
     return {"connected": True, "output_dir": config["output_dir"]}
 
 
 @app.post("/api/smb/disconnect")
 def smb_disconnect() -> dict:
-    global _smb_connected, _smb_state
-    smbclient.reset_connection_cache()
+    global _smb_connected
     with _smb_lock:
         _smb_connected = False
-        _smb_state = {}
-    config.pop("smb", None)
-    config["output_dir"] = DEFAULT_OUTPUT
-    save_config(config)
+    with _config_lock:
+        updated = dict(config)
+        updated.pop("smb", None)
+        save_config(updated)
+        config.pop("smb", None)
     return {"connected": False, "output_dir": config["output_dir"]}
 
 

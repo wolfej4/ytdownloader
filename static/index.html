@@ -203,6 +203,21 @@
   .ep-badge.avail:hover { border-color: var(--ok); }
   .ep-badge.selected { background: var(--accent); border-color: var(--accent); color: #fff; }
   .ep-badge:disabled { cursor: not-allowed; opacity: .6; }
+  select { background: var(--bg); color: var(--text); border: 1px solid var(--line); border-radius: 7px; padding: 10px; font: inherit; }
+  .controls { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin: 12px 0; }
+  .settings-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; margin: 16px 0; }
+  .settings-grid input[type=number] { width: 100%; }
+  .notice { color: var(--warn); white-space: pre-wrap; font-size: 13px; }
+  .summary { display: flex; flex-wrap: wrap; gap: 14px; margin: 12px 0; font-size: 13px; color: var(--muted); }
+  .job.paused, .job.retry_wait { border-left-color: var(--warn); }
+  .job-state.paused, .job-state.retry_wait { color: var(--warn); }
+  .job log, pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 11px; }
+  details > summary { cursor: pointer; }
+  .ep-row small { display: block; color: var(--muted); }
+  .batch { border-top: 1px solid var(--line); padding: 9px 0; font-size: 13px; }
+  .follow { padding: 10px 0; border-bottom: 1px solid var(--line); }
+  .filters input { flex: 1; min-width: 140px; }
+  @media (max-width: 600px) { .settings-grid { grid-template-columns: 1fr; } .job-top { flex-wrap: wrap; } .section-btns { flex-wrap: wrap; } }
 </style>
 </head>
 <body>
@@ -246,6 +261,30 @@
     </div>
   </div>
 
+  <details class="panel" id="settingsPanel">
+    <summary>Storage, retries, and notifications</summary>
+    <div class="settings-grid">
+      <label>Local download folder<input type="text" id="outputDir" /></label>
+      <label>Staging folder<input type="text" id="stagingDir" /></label>
+      <label>Free space reserve (GiB)<input type="number" id="minFree" min="0" step="0.5" /></label>
+      <label>Automatic retries<input type="number" id="maxRetries" min="0" max="10" /></label>
+      <label>Initial retry delay (seconds)<input type="number" id="retryDelay" min="1" max="300" /></label>
+      <label>Bandwidth per worker<input type="text" id="bandwidth" placeholder="5M, 500K, or blank for unlimited" /></label>
+      <label>ntfy topic URL<input type="text" id="ntfyUrl" placeholder="https://ntfy.example.com/rt-grabber" /></label>
+      <label>ntfy access token<input type="password" id="ntfyToken" autocomplete="new-password" /></label>
+      <label>Proxmox pool status file (optional)<input type="text" id="poolFile" /></label>
+      <label>Pool usage pause threshold (%)<input type="number" id="poolThreshold" min="50" max="99.9" step="0.1" /></label>
+    </div>
+    <div class="controls">
+      <button id="saveSettings" class="primary">Save settings</button>
+      <button id="testNtfy">Send test notification</button>
+      <button id="clearNtfyToken">Clear saved token</button>
+      <button id="checkStorage">Check storage</button>
+    </div>
+    <p class="browse-meta">Mount staging on storage with room for active downloads. Saved tokens stay hidden. Bandwidth applies separately to each worker.</p>
+    <div id="storageStatus" class="notice" role="status"></div>
+  </details>
+
   <div class="panel">
     <label class="label" for="urls">URLs — one per line</label>
     <textarea id="urls" spellcheck="false" placeholder="https://archive.org/details/...&#10;https://www.youtube.com/watch?v=..."></textarea>
@@ -282,12 +321,40 @@
           <input type="checkbox" id="selectAllEpisodes"> Select all
         </label>
       </div>
+      <div class="controls filters">
+        <input type="text" id="episodeFilter" aria-label="Filter loaded episodes" placeholder="Filter loaded titles" />
+        <select id="seasonFilter" aria-label="Season"><option value="">All seasons</option></select>
+        <select id="yearFilter" aria-label="Year"><option value="">All years</option></select>
+        <select id="sourceFilter" aria-label="Source"><option value="">Either source</option><option value="roosterteeth">Website available</option><option value="youtube">YouTube available</option></select>
+        <select id="downloadFilter" aria-label="Download status"><option value="">Any download status</option><option value="missing">Missing</option><option value="queued">Queued or failed</option><option value="downloaded">Downloaded</option></select>
+      </div>
+      <div class="controls">
+        <button id="selectMissing">Select missing</button>
+        <button id="loadMoreEpisodes">Load next page</button>
+        <button id="loadAllEpisodes">Load all remaining</button>
+        <button id="followShow">Follow this show</button>
+        <span id="episodeCount" class="browse-meta" role="status"></span>
+      </div>
       <div id="episodeList" class="browse-list"></div>
+      <div class="controls">
+        <button id="previousEpisodes">Previous</button><span id="episodePage" class="browse-meta"></span><button id="nextEpisodes">Next</button>
+      </div>
       <div class="row" style="margin-top:12px;justify-content:flex-end">
         <button class="primary" id="queueSelected">Queue selected</button>
       </div>
     </div>
   </div>
+
+  <details class="panel">
+    <summary>Followed shows</summary>
+    <div class="controls">
+      <label>Check every <input type="number" id="followHours" value="6" min="0.25" max="720" step="0.25" /> hours</label>
+      <label><input type="checkbox" id="followAuto"> Queue newly archived episodes</label>
+      <button id="checkFollows">Check now</button>
+    </div>
+    <p class="browse-meta">The first check records the existing catalog. Later checks detect newly archived episodes. Choose the interval and automatic queue option before following a show.</p>
+    <div id="follows"></div>
+  </details>
 
   <div class="panel">
     <div class="row spread" style="margin-bottom:10px">
@@ -301,6 +368,10 @@
       <button class="primary pref-btn" id="scanThumbs">Scan for missing thumbnails</button>
       <span class="browse-meta" id="scanStatus"></span>
     </div>
+    <div class="controls">
+      <button id="scanLibrary">Scan existing downloads into history</button>
+      <span id="libraryStatus" class="browse-meta" role="status"></span>
+    </div>
   </div>
 
   <h2 class="section">
@@ -311,443 +382,24 @@
       <button class="clear-btn" id="clear">Clear all</button>
     </span>
   </h2>
+  <div class="controls filters">
+    <button id="pauseQueue">Pause queue</button>
+    <input type="text" id="jobSearch" aria-label="Search transfers" placeholder="Search titles, shows, URLs, or errors" />
+    <select id="jobStatus" aria-label="Transfer status">
+      <option value="">All statuses</option><option>queued</option><option>running</option><option>uploading</option>
+      <option>retry_wait</option><option>paused</option><option>done</option><option>error</option><option>cancelled</option>
+    </select>
+  </div>
+  <div id="queueSummary" class="summary" role="status"></div>
+  <div id="pauseReason" class="notice" role="alert"></div>
+  <details class="panel"><summary>Batch progress</summary><div id="batches"></div></details>
   <div id="jobs"><div class="empty">No transfers yet.</div></div>
+  <div class="controls"><button id="previousJobs">Previous</button><span id="jobPage" class="browse-meta"></span><button id="nextJobs">Next</button></div>
 </div>
 
 <div class="toast" id="toast"></div>
 <button class="to-top" id="toTop" title="Back to top" aria-label="Back to top">&uarr;</button>
 
-<script>
-const $ = (id) => document.getElementById(id);
-
-function toast(msg) {
-  const t = $("toast");
-  t.textContent = msg; t.classList.add("show");
-  clearTimeout(t._t); t._t = setTimeout(() => t.classList.remove("show"), 2600);
-}
-
-async function loadConfig() {
-  try {
-    const r = await fetch("/api/config");
-    const c = await r.json();
-    const pills = [];
-    pills.push(`<span class="pill ${c.yt_dlp_ok ? "good" : "bad"}">yt-dlp ${c.yt_dlp_ok ? "ready" : "missing"}</span>`);
-    pills.push(`<span class="pill ${c.ffmpeg_ok ? "good" : "bad"}">ffmpeg ${c.ffmpeg_ok ? "ready" : "missing"}</span>`);
-    $("pills").innerHTML = pills.join("");
-    if (c.max_workers) $("workerCount").value = c.max_workers;
-    updateSmb(c);
-  } catch (e) { toast("Couldn't reach the server."); }
-}
-
-function updateSmb(c) {
-  const ok = c.smb_connected;
-  const smb = c.smb || {};
-  $("smbStatus").textContent = ok ? `Connected — //${smb.host}/${smb.share}` : "Not connected";
-  $("smbStatus").className = `pill ${ok ? "good" : ""}`;
-  $("smbConnect").style.display = ok ? "none" : "";
-  $("smbDisconnect").style.display = ok ? "" : "none";
-  if (!ok) {
-    if (smb.host)    $("smbHost").value   = smb.host;
-    if (smb.share)   $("smbShare").value  = smb.share;
-    if (smb.username)$("smbUser").value   = smb.username;
-    if (smb.subdir)  $("smbSubdir").value = smb.subdir;
-  }
-}
-
-$("smbConnect").onclick = async () => {
-  const btn = $("smbConnect"); btn.disabled = true;
-  try {
-    const r = await fetch("/api/smb/connect", {
-      method: "POST", headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({
-        host: $("smbHost").value.trim(),
-        share: $("smbShare").value.trim(),
-        username: $("smbUser").value,
-        password: $("smbPass").value,
-        subdir: $("smbSubdir").value.trim(),
-      }),
-    });
-    const d = await r.json();
-    if (r.ok) { toast("Connected to SMB share."); loadConfig(); }
-    else { toast(d.detail || "Connection failed."); }
-  } finally { btn.disabled = false; }
-};
-
-$("smbDisconnect").onclick = async () => {
-  const btn = $("smbDisconnect"); btn.disabled = true;
-  try {
-    const r = await fetch("/api/smb/disconnect", { method: "POST" });
-    const d = await r.json();
-    if (r.ok) { toast("Disconnected."); loadConfig(); }
-    else { toast(d.detail || "Disconnect failed."); }
-  } finally { btn.disabled = false; }
-};
-
-$("saveWorkers").onclick = async () => {
-  const n = parseInt($("workerCount").value, 10);
-  if (!n || n < 1) { toast("Enter a number between 1 and 20."); return; }
-  const btn = $("saveWorkers"); btn.disabled = true;
-  try {
-    const r = await fetch("/api/workers", {
-      method: "POST", headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({ max_workers: n }),
-    });
-    const d = await r.json();
-    if (r.ok) { $("workerCount").value = d.max_workers; toast(`Workers set to ${d.max_workers}.`); }
-    else { toast(d.detail || "Failed to update."); }
-  } finally { btn.disabled = false; }
-};
-
-$("start").onclick = async () => {
-  const urls = $("urls").value.split("\n").map(s => s.trim()).filter(Boolean);
-  if (!urls.length) { toast("Add at least one URL."); return; }
-  const btn = $("start"); btn.disabled = true;
-  try {
-    const r = await fetch("/api/download", {
-      method: "POST", headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({ urls }),
-    });
-    if (r.ok) { $("urls").value = ""; toast(`Queued ${urls.length} item${urls.length > 1 ? "s" : ""}.`); refresh(); }
-    else { const e = await r.json(); toast(e.detail || "Couldn't queue downloads."); }
-  } finally { btn.disabled = false; }
-};
-
-$("clear").onclick = async () => { await fetch("/api/jobs/clear", { method: "POST" }); refresh(); };
-$("clearDone").onclick = async () => { await fetch("/api/jobs/clear/done", { method: "POST" }); refresh(); };
-
-$("retryFailed").onclick = async () => {
-  const btn = $("retryFailed"); btn.disabled = true;
-  try {
-    const r = await fetch("/api/jobs/retry/failed", { method: "POST" });
-    const d = await r.json();
-    if (r.ok) { toast(d.retried ? `Retrying ${d.retried} failed item${d.retried > 1 ? "s" : ""}.` : "No failed downloads to retry."); refresh(); }
-    else { toast(d.detail || "Couldn't retry failed downloads."); }
-  } finally { btn.disabled = false; }
-};
-
-// Event delegation for per-job buttons
-$("jobs").addEventListener("click", async (e) => {
-  const btn = e.target.closest("[data-action]");
-  if (!btn) return;
-  const { action, jobId } = btn.dataset;
-  btn.disabled = true;
-  try {
-    const r = action === "remove"
-      ? await fetch(`/api/jobs/${jobId}`, { method: "DELETE" })
-      : await fetch(`/api/jobs/${jobId}/${action}`, { method: "POST" });
-    if (!r.ok) { const d = await r.json(); toast(d.detail || "Failed."); }
-    else { refresh(); }
-  } catch { toast("Request failed."); }
-  finally { btn.disabled = false; }
-});
-
-function row(j) {
-  const title = j.title || "Resolving…";
-  const counter = (j.total && j.total > 1) ? ` · item ${j.current || 0}/${j.total}` : "";
-  const pct = j.percent != null ? j.percent : 0;
-  const active = ["queued", "running", "uploading"].includes(j.status);
-  const finished = ["done", "error", "cancelled"].includes(j.status);
-  const retryable = ["error", "cancelled"].includes(j.status);
-
-  const cancelBtn = active
-    ? `<button class="job-btn cancel" data-action="cancel" data-job-id="${j.id}">✕</button>`
-    : "";
-  const retryBtn = retryable
-    ? `<button class="job-btn retry" data-action="retry" data-job-id="${j.id}">Retry</button>`
-    : "";
-  const removeBtn = finished
-    ? `<button class="job-btn remove" data-action="remove" data-job-id="${j.id}" title="Remove from list">✕</button>`
-    : "";
-
-  const err = j.status === "error" && j.error ? `<div class="err">${escapeHtml(j.error)}</div>` : "";
-
-  const thumbHtml = (j.thumbnail_url && j.title)
-    ? `<img class="job-thumb" src="${escapeHtml(j.thumbnail_url)}" alt="" loading="lazy" onerror="this.style.display='none'">`
-    : `<div class="job-thumb-empty"></div>`;
-
-  return `<div class="job ${j.status}" data-job-id="${j.id}">
-    <div class="job-top">
-      ${thumbHtml}
-      <div style="min-width:0;flex:1">
-        <div class="job-title">${escapeHtml(title)}${counter}</div>
-        <div class="job-url">${escapeHtml(j.url)}</div>
-      </div>
-      <div class="job-right">
-        ${cancelBtn}${retryBtn}${removeBtn}
-        <div class="job-state ${j.status}">${j.status}</div>
-      </div>
-    </div>
-    <div class="bar"><span style="width:${Math.max(0, Math.min(100, pct))}%"></span></div>
-    <div class="stats">${statsInner(j)}</div>
-    ${err}
-  </div>`;
-}
-
-function escapeHtml(s) {
-  return String(s).replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c]));
-}
-
-function statsInner(j) {
-  if (j.status !== "running") return "";
-  const pct = j.percent != null ? j.percent : 0;
-  return `<span><b>${j.percent_str || pct.toFixed(0)+"%"}</b></span>`
-    + (j.speed ? `<span>${j.speed}</span>` : "")
-    + (j.eta   ? `<span>ETA ${j.eta}</span>` : "");
-}
-
-// Fields that require a full card rebuild when they change.
-// Live progress (percent/speed/eta) is updated surgically without touching the img.
-function structKey(j) {
-  return `${j.status}|${j.title}|${j.thumbnail_url}|${j.error}|${j.current}|${j.total}`;
-}
-
-let _structKeys = {};
-
-async function refresh() {
-  try {
-    const r = await fetch("/api/jobs");
-    const { jobs } = await r.json();
-    const el = $("jobs");
-
-    if (!jobs.length) {
-      el.innerHTML = `<div class="empty">No transfers yet.</div>`;
-      _structKeys = {};
-      return;
-    }
-
-    const cards = el.querySelectorAll(".job[data-job-id]");
-    if (cards.length !== jobs.length || jobs.some((j, i) => j.id !== cards[i].dataset.jobId)) {
-      // List order or membership changed — full rebuild
-      el.innerHTML = jobs.map(row).join("");
-      _structKeys = {};
-      jobs.forEach(j => { _structKeys[j.id] = structKey(j); });
-      return;
-    }
-
-    for (const [i, j] of jobs.entries()) {
-      const card = cards[i];
-      const sk = structKey(j);
-      if (_structKeys[j.id] !== sk) {
-        // Structure changed (title resolved, thumbnail appeared, status flipped, etc.)
-        // Replace the whole card — this is rare after the first progress event.
-        const tmp = document.createElement("div");
-        tmp.innerHTML = row(j);
-        card.replaceWith(tmp.firstElementChild);
-        _structKeys[j.id] = sk;
-      } else if (j.status === "running") {
-        // Only live progress changed — update bar and stats without touching the img
-        const pct = j.percent != null ? j.percent : 0;
-        const barSpan = card.querySelector(".bar > span");
-        if (barSpan) barSpan.style.width = `${Math.max(0, Math.min(100, pct))}%`;
-        const statsEl = card.querySelector(".stats");
-        if (statsEl) statsEl.innerHTML = statsInner(j);
-      }
-    }
-  } catch (e) { /* keep last render on transient errors */ }
-}
-
-// --- RT Archive browse ---
-let currentPref = "roosterteeth";
-let currentEpisodes = [];
-
-function defaultPlatform(ep) {
-  if (currentPref === "youtube" && ep.youtube_url) return "youtube";
-  if (currentPref === "roosterteeth" && ep.rt_url) return "roosterteeth";
-  return ep.rt_url ? "roosterteeth" : (ep.youtube_url ? "youtube" : null);
-}
-
-function setPref(p) {
-  currentPref = p;
-  $("prefRt").classList.toggle("active", p === "roosterteeth");
-  $("prefYt").classList.toggle("active", p === "youtube");
-  // Re-apply the new default to every row that's currently shown, so the
-  // global toggle affects the whole visible list at once.
-  currentEpisodes.forEach(ep => { ep.selected = defaultPlatform(ep); });
-  $("episodeList").querySelectorAll(".ep-row").forEach((row, i) => {
-    const ep = currentEpisodes[i];
-    if (!ep) return;
-    row.querySelectorAll(".ep-badge").forEach(b => {
-      b.classList.toggle("selected", b.dataset.platform === ep.selected);
-    });
-  });
-}
-$("prefRt").onclick = () => setPref("roosterteeth");
-$("prefYt").onclick = () => setPref("youtube");
-setPref("roosterteeth");
-
-let _searchTimer;
-$("showSearch").addEventListener("input", () => {
-  clearTimeout(_searchTimer);
-  _searchTimer = setTimeout(searchShows, 300);
-});
-
-async function searchShows() {
-  const q = $("showSearch").value.trim();
-  const el = $("showResults");
-  el.style.display = "";
-  el.innerHTML = `<div class="empty" style="padding:14px;border:none">Searching…</div>`;
-  try {
-    const r = await fetch(`/api/browse/shows?q=${encodeURIComponent(q)}`);
-    const { shows } = await r.json();
-    if (!shows.length) { el.innerHTML = `<div class="empty" style="padding:14px;border:none">No shows found.</div>`; return; }
-    el.innerHTML = shows.map(s => `
-      <div class="browse-item" data-show-id="${escapeHtml(s.id)}" data-show-title="${escapeHtml(s.title)}">
-        ${s.thumbnail ? `<img src="${escapeHtml(s.thumbnail)}" loading="lazy" onerror="this.remove()">` : ""}
-        <div style="min-width:0;flex:1">
-          <div>${escapeHtml(s.title)}</div>
-          <div class="browse-meta">${s.episode_count || 0} episodes</div>
-        </div>
-      </div>`).join("");
-  } catch { el.innerHTML = `<div class="empty" style="padding:14px;border:none">Search failed.</div>`; }
-}
-
-$("showResults").addEventListener("click", (e) => {
-  const item = e.target.closest("[data-show-id]");
-  if (!item) return;
-  loadEpisodes(item.dataset.showId, item.dataset.showTitle);
-});
-
-function renderEpisodes(episodes, headerText, showShowName) {
-  $("episodePanel").style.display = "";
-  $("episodeShowTitle").textContent = headerText;
-  $("selectAllEpisodes").checked = false;
-  currentEpisodes = episodes;
-  const el = $("episodeList");
-  if (!episodes.length) { el.innerHTML = `<div class="empty" style="padding:14px;border:none">No episodes found.</div>`; return; }
-  el.innerHTML = episodes.map((ep, i) => {
-    ep.selected = defaultPlatform(ep);
-    const se = (ep.season != null && ep.episode_number != null)
-      ? `S${String(ep.season).padStart(2,"0")}E${String(ep.episode_number).padStart(2,"0")} — `
-      : "";
-    const showLine = (showShowName && ep.show)
-      ? `<span class="browse-meta" style="display:block">${escapeHtml(ep.show)}</span>` : "";
-    const rtBtn = `<button type="button" class="ep-badge ${ep.rt_url ? "avail" : ""} ${ep.selected === "roosterteeth" ? "selected" : ""}"
-        data-idx="${i}" data-platform="roosterteeth" ${ep.rt_url ? "" : "disabled"}
-        title="${ep.rt_url ? "Use the Website source" : "Not available on the Website"}">RT</button>`;
-    const ytBtn = `<button type="button" class="ep-badge ${ep.youtube_url ? "avail" : ""} ${ep.selected === "youtube" ? "selected" : ""}"
-        data-idx="${i}" data-platform="youtube" ${ep.youtube_url ? "" : "disabled"}
-        title="${ep.youtube_url ? "Use the YouTube source" : "Not available on YouTube"}">YT</button>`;
-    return `
-    <div class="ep-row">
-      <input type="checkbox" class="ep-check" data-idx="${i}">
-      <span style="min-width:0;flex:1">
-        <span class="browse-meta">${se}</span>${escapeHtml(ep.title)}
-        ${showLine}
-      </span>
-      <span class="ep-badges">${rtBtn}${ytBtn}</span>
-    </div>`;
-  }).join("");
-}
-
-async function loadEpisodes(showId, showTitle) {
-  $("episodePanel").style.display = "";
-  $("episodeShowTitle").textContent = showTitle;
-  $("episodeList").innerHTML = `<div class="empty" style="padding:14px;border:none">Loading…</div>`;
-  try {
-    const r = await fetch(`/api/browse/shows/${encodeURIComponent(showId)}/episodes`);
-    const { episodes } = await r.json();
-    renderEpisodes(episodes, `${showTitle} (${episodes.length.toLocaleString()} episodes)`, false);
-  } catch { $("episodeList").innerHTML = `<div class="empty" style="padding:14px;border:none">Failed to load episodes.</div>`; }
-}
-
-let _episodeSearchTimer;
-$("episodeSearch").addEventListener("input", () => {
-  clearTimeout(_episodeSearchTimer);
-  _episodeSearchTimer = setTimeout(searchEpisodesDirect, 350);
-});
-
-async function searchEpisodesDirect() {
-  const q = $("episodeSearch").value.trim();
-  if (!q) { $("episodePanel").style.display = "none"; return; }
-  const header = `Search: "${q}"`;
-  $("episodePanel").style.display = "";
-  $("episodeShowTitle").textContent = header;
-  $("episodeList").innerHTML = `<div class="empty" style="padding:14px;border:none">Searching…</div>`;
-  try {
-    const r = await fetch(`/api/browse/episodes?q=${encodeURIComponent(q)}`);
-    const { episodes } = await r.json();
-    renderEpisodes(episodes, header, true);
-  } catch { $("episodeList").innerHTML = `<div class="empty" style="padding:14px;border:none">Search failed.</div>`; }
-}
-
-$("selectAllEpisodes").onchange = (e) => {
-  $("episodeList").querySelectorAll(".ep-check").forEach(cb => cb.checked = e.target.checked);
-};
-
-$("episodeList").addEventListener("click", (e) => {
-  const badge = e.target.closest(".ep-badge");
-  if (!badge || badge.disabled) return;
-  const ep = currentEpisodes[+badge.dataset.idx];
-  if (!ep) return;
-  ep.selected = badge.dataset.platform;
-  badge.closest(".ep-row").querySelectorAll(".ep-badge").forEach(b => {
-    b.classList.toggle("selected", b.dataset.platform === ep.selected);
-  });
-});
-
-$("queueSelected").onclick = async () => {
-  const checks = [...$("episodeList").querySelectorAll(".ep-check:checked")];
-  if (!checks.length) { toast("Select at least one episode."); return; }
-  const items = [];
-  for (const cb of checks) {
-    const ep = currentEpisodes[+cb.dataset.idx];
-    const url = ep.selected === "youtube" ? ep.youtube_url : ep.rt_url;
-    if (url) items.push({ url, show: ep.show, season: ep.season, episode: ep.episode_number });
-  }
-  if (!items.length) { toast("None of the selected episodes are archived."); return; }
-  const btn = $("queueSelected"); btn.disabled = true;
-  try {
-    const r = await fetch("/api/download", {
-      method: "POST", headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({ items }),
-    });
-    if (r.ok) { toast(`Queued ${items.length} item${items.length > 1 ? "s" : ""}.`); refresh(); }
-    else { const e = await r.json(); toast(e.detail || "Couldn't queue downloads."); }
-  } finally { btn.disabled = false; }
-};
-
-// --- Thumbnail backfill scan ---
-async function pollScanStatus() {
-  try {
-    const r = await fetch("/api/thumbnails/scan");
-    const s = await r.json();
-    const btn = $("scanThumbs");
-    const status = $("scanStatus");
-    if (s.running) {
-      btn.disabled = true;
-      btn.textContent = "Scanning…";
-      status.textContent = `${s.checked}/${s.total} checked · ${s.added} added${s.errors ? ` · ${s.errors} failed` : ""}`;
-    } else {
-      btn.disabled = false;
-      btn.textContent = "Scan for missing thumbnails";
-      status.textContent = s.finished_at
-        ? `Last scan: ${s.checked} checked, ${s.added} added${s.errors ? `, ${s.errors} failed` : ""}.`
-        : "";
-    }
-  } catch { /* keep last state on transient errors */ }
-}
-
-$("scanThumbs").onclick = async () => {
-  try {
-    const r = await fetch("/api/thumbnails/scan", { method: "POST" });
-    if (!r.ok) { const d = await r.json(); toast(d.detail || "Couldn't start scan."); return; }
-    toast("Scanning for missing thumbnails…");
-    pollScanStatus();
-  } catch { toast("Couldn't start scan."); }
-};
-
-pollScanStatus();
-setInterval(pollScanStatus, 1500);
-
-// --- Back to top ---
-$("toTop").onclick = () => window.scrollTo({ top: 0, behavior: "smooth" });
-window.addEventListener("scroll", () => {
-  $("toTop").classList.toggle("show", window.scrollY > 400);
-}, { passive: true });
-
-loadConfig();
-refresh();
-setInterval(refresh, 1000);
-</script>
+<script src="/static/app.js" defer></script>
 </body>
 </html>
