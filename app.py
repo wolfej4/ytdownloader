@@ -745,6 +745,7 @@ class DownloadItem(BaseModel):
 class DownloadRequest(BaseModel):
     urls: list[str] = Field(default_factory=list)
     items: list[DownloadItem] = Field(default_factory=list)
+    redownload: bool = False
 
 
 class ConfigRequest(BaseModel):
@@ -844,7 +845,7 @@ def submit(req: DownloadRequest) -> dict:
     if not items:
         raise HTTPException(400, "No URLs provided")
     prepared = prepare_items(items)
-    result = store.enqueue(prepared)
+    result = store.enqueue(prepared, redownload=req.redownload)
     manager.wake.set()
     return result
 

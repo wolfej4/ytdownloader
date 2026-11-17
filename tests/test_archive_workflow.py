@@ -323,6 +323,57 @@ class ArchiveWorkflowTests(unittest.TestCase):
         self.assertIn("missing", job["error"])
         self.assertEqual(self.store.history(job["destination"])[0], set())
 
+    def test_redownload_selected_ignores_completed_rows_and_blocks_existing_jobs(self):
+        jid = self.enqueue(keys=["ia:youtube-mirror", "youtube:mirror"])
+        self.store.finish(jid, ["archive.org roosterteeth-123"])
+        payload = {"items": [{"url": "https://youtu.be/mirror", "keys": ["ia:roosterteeth-123"]}]}
+        normal = self.client.post("/api/download", json=payload).json()
+        self.assertEqual(normal["created"], [])
+        payload["redownload"] = True
+        fresh = self.client.post("/api/download", json=payload).json()
+        self.assertEqual(len(fresh["created"]), 1)
+        job = self.store.get(fresh["created"][0])
+        self.assertTrue(job["redownload"])
+        self.assertEqual(job["target"], app.current_target())
+        duplicate = self.client.post("/api/download", json=payload).json()
+        self.assertEqual(duplicate["created"], [])
+        self.assertEqual(duplicate["skipped"], 1)
+        self.assertEqual(self.store.get(jid)["status"], "done")
+
+    def test_redownload_starts_with_empty_archive_then_publishes_new_copy(self):
+        original = self.enqueue(show="Example", season=2, episode=3)
+        self.store.finish(original, ["archive.org roosterteeth-123"])
+        result = self.client.post("/api/download", json={"redownload": True, "items": [{
+            "url": "https://archive.org/details/roosterteeth-123", "show": "Example", "season": 2, "episode": 3,
+        }]}).json()
+        fresh_id = result["created"][0]
+
+        def download(job, media, archive):
+            self.assertEqual(archive.read_text().strip(), "")
+            self.fake_download(job, media, archive)
+
+        with patch.object(self.manager, "download", side_effect=download):
+            self.manager.run_job(self.store.claim(3))
+        self.assertEqual(self.store.get(fresh_id)["status"], "done")
+        output = self.root / "output" / "Example" / "Season 02" / "S02E03 - Title [roosterteeth-123].mkv"
+        self.assertEqual(output.read_bytes(), b"video bytes")
+        self.assertEqual(self.store.get(original)["status"], "done")
+
+    def test_pasted_url_redownload_flag_survives_restart(self):
+        jid = self.enqueue()
+        self.store.finish(jid, ["archive.org roosterteeth-123"])
+        result = self.client.post("/api/download", json={
+            "urls": ["https://archive.org/details/roosterteeth-123"], "redownload": True,
+        }).json()
+        fresh_id = result["created"][0]
+        self.store.close()
+        self.store = JobStore(self.root / "config" / "state.sqlite3")
+        app.store = self.store
+        self.manager.store = self.store
+        self.store.recover()
+        self.assertTrue(self.store.get(fresh_id)["redownload"])
+        self.assertEqual(self.store.get(fresh_id)["status"], "queued")
+
 
 if __name__ == "__main__":
     unittest.main()

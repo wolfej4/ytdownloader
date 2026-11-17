@@ -297,7 +297,8 @@ class DownloadManager:
             media.mkdir(parents=True, exist_ok=True)
             archive = work / "archive.txt"
             if not archive.exists():
-                archive.write_text("\n".join(self.store.archive(job["destination"])) + "\n", encoding="utf-8")
+                entries = [] if job.get("redownload") else self.store.archive(job["destination"])
+                archive.write_text("\n".join(entries) + "\n", encoding="utf-8")
             current = self.store.get(job["id"])
             if current.get("download_complete"):
                 expected = current.get("video_files", [])

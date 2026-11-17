@@ -117,7 +117,7 @@ class JobStore:
         with self.transaction():
             self.db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", (key, json.dumps(value)))
 
-    def enqueue(self, items):
+    def enqueue(self, items, redownload=False):
         created, skipped = [], 0
         batch_id = uuid.uuid4().hex
         with self.transaction():
@@ -130,13 +130,14 @@ class JobStore:
                 ).fetchone()
                 pending = self.db.execute(
                     f"SELECT 1 FROM job_keys k JOIN jobs j ON j.id=k.job_id "
-                    f"WHERE k.destination=? AND k.key IN ({placeholders}) AND j.status!='cancelled' LIMIT 1",
+                    f"WHERE k.destination=? AND k.key IN ({placeholders}) "
+                    "AND j.status NOT IN ('cancelled','done') LIMIT 1",
                     (destination, *keys),
                 ).fetchone()
-                if found or pending:
+                if pending or (found and not redownload):
                     skipped += 1
                     continue
-                job = dict(item, id=uuid.uuid4().hex, batch_id=batch_id, status="queued",
+                job = dict(item, id=uuid.uuid4().hex, batch_id=batch_id, status="queued", redownload=redownload,
                            queued_at=time.time(), next_attempt_at=0, attempts=0,
                            percent=0, percent_str="", speed="", eta="", error="",
                            thumbnail_url="", current=None, total=None, downloaded_bytes=0,
